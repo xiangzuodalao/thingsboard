@@ -931,6 +931,12 @@
                             <exclude>**/valkey-certs/**</exclude>
                             <exclude>**/data/certs/**</exclude>
                             <exclude>**/*.otf</exclude>
+                            <exclude>**/.env.example</exclude>
+                            <exclude>**/.venv/**</exclude>
+                            <exclude>**/.runtime/**</exclude>
+                            <exclude>**/__pycache__/**</exclude>
+                            <exclude>**/*.pyc</exclude>
+                            <exclude>dev/automotive-factory/requirements.txt</exclude>
                         </excludes>
                         <mapping>
                             <proto>JAVADOC_STYLE</proto>
