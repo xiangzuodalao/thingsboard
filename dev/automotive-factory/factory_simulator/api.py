@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -31,28 +32,53 @@ class ThingsBoardApiError(RuntimeError):
     """Raised for an unsuccessful ThingsBoard REST operation."""
 
 
+def redact_sensitive_text(value: str) -> str:
+    """Keep credentials out of operator-facing exceptions and logs."""
+
+    redacted = re.sub(
+        r"(?i)\bbearer\s+[^\s,;]+", "Bearer [REDACTED]", value
+    )
+    redacted = re.sub(
+        r"(?i)\b((?:access[_ -]?token|refresh[_ -]?token|api[_ -]?key|"
+        r"password|secret|credential)\s*[=:]\s*)[^\s,;]+",
+        r"\1[REDACTED]",
+        redacted,
+    )
+    return redacted
+
+
 class ThingsBoardApi:
-    def __init__(self, config: AppConfig):
+    def __init__(self, config: AppConfig, *, bearer_token: str | None = None):
         self.config = config
         self.base_url = config.thingsboard["base_url"].rstrip("/")
         self.timeout = float(config.thingsboard.get("request_timeout_seconds", 10))
-        self.username, self.password = config.tenant_credentials()
+        self._preauthenticated = bool(bearer_token)
+        if self._preauthenticated:
+            self.username = None
+            self.password = None
+        else:
+            self.username, self.password = config.tenant_credentials()
         self.session = requests.Session()
-        self.token: str | None = None
+        self.token = bearer_token
         self.refresh_token: str | None = None
+        if bearer_token:
+            self.session.headers.update({"X-Authorization": f"Bearer {bearer_token}"})
 
     def login(self) -> None:
+        if self._preauthenticated:
+            raise ThingsBoardApiError("preauthenticated bearer credential was rejected")
         response = self.session.post(
             f"{self.base_url}/api/auth/login",
             json={"username": self.username, "password": self.password},
             timeout=self.timeout,
         )
         if not response.ok:
-            raise ThingsBoardApiError(
-                f"ThingsBoard login failed ({response.status_code}): {response.text[:300]}"
-            )
-        payload = response.json()
-        self.token = payload["token"]
+            raise ThingsBoardApiError(f"ThingsBoard login failed ({response.status_code})")
+        try:
+            payload = response.json()
+            self.token = payload["token"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ThingsBoardApiError("ThingsBoard login returned an invalid response") from exc
         self.refresh_token = payload.get("refreshToken")
         self.session.headers.update({"X-Authorization": f"Bearer {self.token}"})
 
@@ -72,7 +98,7 @@ class ThingsBoardApi:
             timeout=self.timeout,
             **kwargs,
         )
-        if response.status_code == 401:
+        if response.status_code == 401 and not self._preauthenticated:
             self.login()
             response = self.session.request(
                 method,
@@ -83,9 +109,7 @@ class ThingsBoardApi:
         if allow_not_found and response.status_code == 404:
             return response
         if not response.ok:
-            raise ThingsBoardApiError(
-                f"{method} {path} failed ({response.status_code}): {response.text[:500]}"
-            )
+            raise ThingsBoardApiError(f"{method} {path} failed ({response.status_code})")
         return response
 
     def wait_until_ready(self, timeout_seconds: float = 180) -> None:
@@ -96,7 +120,7 @@ class ThingsBoardApi:
                 self.login()
                 return
             except (requests.RequestException, ThingsBoardApiError) as exc:
-                last_error = str(exc)
+                last_error = redact_sensitive_text(str(exc))
                 time.sleep(2)
         raise ThingsBoardApiError(
             f"ThingsBoard did not become ready within {timeout_seconds:.0f}s: {last_error}"
@@ -189,17 +213,22 @@ class ThingsBoardApi:
         ).json()
         return payload.get("data", [])
 
-    def find_dashboard(self, title: str) -> dict[str, Any] | None:
+    def find_dashboards(self, title: str) -> list[dict[str, Any]]:
         payload = self.request(
             "GET",
             "/api/tenant/dashboards",
             params={"pageSize": 100, "page": 0, "textSearch": title},
         ).json()
+        dashboards: list[dict[str, Any]] = []
         for item in payload.get("data", []):
             if item.get("title") == title:
                 dashboard_id = item["id"]["id"]
-                return self.request("GET", f"/api/dashboard/{dashboard_id}").json()
-        return None
+                dashboards.append(self.request("GET", f"/api/dashboard/{dashboard_id}").json())
+        return dashboards
+
+    def find_dashboard(self, title: str) -> dict[str, Any] | None:
+        dashboards = self.find_dashboards(title)
+        return dashboards[0] if dashboards else None
 
     def save_dashboard(self, dashboard: dict[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/dashboard", json=dashboard).json()

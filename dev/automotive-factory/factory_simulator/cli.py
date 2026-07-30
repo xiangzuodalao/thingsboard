@@ -27,7 +27,7 @@ from typing import Any, Sequence
 
 from requests import RequestException
 
-from .api import ThingsBoardApi, ThingsBoardApiError, provision_devices
+from .api import ThingsBoardApi, ThingsBoardApiError, provision_devices, redact_sensitive_text
 from .config import AppConfig, ConfigError, applicable_faults, load_config
 from .dashboard_publication import (
     DashboardPublicationError,
@@ -743,7 +743,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         OSError,
         ValueError,
     ) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print(f"ERROR: {redact_sensitive_text(str(exc))}", file=sys.stderr)
         return 1
 
 

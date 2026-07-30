@@ -23,6 +23,7 @@ import getpass
 import hashlib
 import json
 import os
+import re
 import stat
 import tempfile
 import uuid
@@ -47,7 +48,15 @@ PLAN_FILENAME = "pdm-dashboard-plan.json"
 RECEIPT_FILENAME = "pdm-dashboard-receipt.json"
 PLAN_TTL = timedelta(minutes=30)
 _SERVER_MANAGED_FIELDS = frozenset({"id", "version", "createdTime", "tenantId"})
-_SENSITIVE_TERMS = ("token", "password", "authorization", "credential", "cookie")
+_SENSITIVE_KEY_TERMS = (
+    "token",
+    "password",
+    "authorization",
+    "credential",
+    "cookie",
+    "secret",
+    "apikey",
+)
 
 
 class DashboardPublicationError(RuntimeError):
@@ -159,9 +168,25 @@ def _exact_dashboard(api: Any, dashboard_id: str) -> dict[str, Any]:
 
 
 def _secret_free(payload: dict[str, Any], *, context: str) -> None:
-    serialized = _canonical_bytes(payload).lower()
-    if any(term.encode("ascii") in serialized for term in _SENSITIVE_TERMS):
-        raise DashboardPublicationError(f"{context} contains a credential-like value")
+    def inspect(value: Any, path: str) -> None:
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                if not isinstance(key, str):
+                    raise DashboardPublicationError(f"{context} contains a credential-like value")
+                normalized = re.sub(r"[^a-z]", "", key.lower())
+                if any(term in normalized for term in _SENSITIVE_KEY_TERMS):
+                    raise DashboardPublicationError(f"{context} contains a credential-like value")
+                inspect(nested, f"{path}.{key}")
+        elif isinstance(value, list):
+            for index, nested in enumerate(value):
+                inspect(nested, f"{path}[{index}]")
+        elif isinstance(value, str) and (
+            re.search(r"(?i)\bbearer\s+\S+", value)
+            or re.fullmatch(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", value)
+        ):
+            raise DashboardPublicationError(f"{context} contains a credential-like value")
+
+    inspect(payload, "$")
 
 
 def _write_owner_only(path: Path, payload: dict[str, Any]) -> None:
@@ -212,6 +237,27 @@ def _receipt_path(config: AppConfig) -> Path:
     return config.runtime_dir / RECEIPT_FILENAME
 
 
+def _managed_api(config: AppConfig) -> ThingsBoardApi:
+    bearer_token = os.environ.get("TB_PDM_DASHBOARD_BEARER_TOKEN")
+    if not bearer_token:
+        raise DashboardPublicationError(
+            "managed dashboard publication requires a preauthenticated bearer credential"
+        )
+    return ThingsBoardApi(config, bearer_token=bearer_token)
+
+
+def _dashboard_candidates(api: Any) -> list[dict[str, Any]]:
+    direct = getattr(api, "find_dashboards", None)
+    if callable(direct):
+        candidates = direct(DASHBOARD_TITLE)
+    else:
+        dashboard = api.find_dashboard(DASHBOARD_TITLE)
+        candidates = [] if dashboard is None else [dashboard]
+    if not isinstance(candidates, list) or not all(isinstance(item, dict) for item in candidates):
+        raise DashboardPublicationError("dashboard discovery returned an invalid response")
+    return candidates
+
+
 def _now_utc(now: datetime | None) -> datetime:
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None:
@@ -229,13 +275,14 @@ def create_dashboard_plan(
 ) -> DashboardPlanResult:
     """Read the dashboard state and write a 30-minute, tenant-bound plan."""
 
-    client = api or ThingsBoardApi(config)
+    client = api or _managed_api(config)
     created_at = _now_utc(now)
     tenant_id = _require_expected_tenant(client)
     device_ids = _resolve_device_ids(client, config)
-    existing = client.find_dashboard(DASHBOARD_TITLE)
-    if existing is not None and not isinstance(existing, dict):
-        raise DashboardPublicationError("existing dashboard response was not a JSON object")
+    candidates = _dashboard_candidates(client)
+    if len(candidates) > 1:
+        raise DashboardPublicationError("dashboard discovery is ambiguous")
+    existing = candidates[0] if candidates else None
     desired_dashboard = _dashboard_payload(
         _dashboard_configuration(client, device_ids), existing
     )
@@ -295,7 +342,7 @@ def _verify_snapshot(api: Any, plan: dict[str, Any]) -> dict[str, Any] | None:
         raise DashboardPublicationError("saved dashboard plan has no snapshot")
     dashboard_id = snapshot.get("dashboard_id")
     if dashboard_id is None:
-        if api.find_dashboard(DASHBOARD_TITLE) is not None:
+        if _dashboard_candidates(api):
             raise DashboardPublicationError("dashboard drift detected before apply")
         return None
     if not isinstance(dashboard_id, str):
@@ -318,6 +365,19 @@ def _validated_desired_dashboard(plan: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(expected_hash, str) or _dashboard_body_sha256(desired) != expected_hash:
         raise DashboardPublicationError("saved dashboard plan desired body hash does not match")
     return desired
+
+
+def _verify_saved_dashboard(
+    response: dict[str, Any],
+    *,
+    desired_body_sha256: str,
+    expected_dashboard_id: str | None,
+) -> None:
+    response_id = _dashboard_id(response)
+    if expected_dashboard_id is not None and response_id != expected_dashboard_id:
+        raise DashboardPublicationError("saved dashboard response does not match the planned dashboard ID")
+    if _dashboard_body_sha256(response) != desired_body_sha256:
+        raise DashboardPublicationError("saved dashboard response does not match the desired body")
 
 
 def _receipt(
@@ -362,7 +422,7 @@ def apply_dashboard_plan(
     applied_at = _now_utc(now)
     if applied_at > _plan_expiry(plan):
         raise DashboardPublicationError("saved dashboard plan has expired")
-    client = api or ThingsBoardApi(config)
+    client = api or _managed_api(config)
     if _require_expected_tenant(client) != plan.get("tenant_id"):
         raise DashboardPublicationError("tenant drift detected before apply")
     desired = _validated_desired_dashboard(plan)
@@ -380,19 +440,40 @@ def apply_dashboard_plan(
 
     try:
         response = client.save_dashboard(copy.deepcopy(desired))
-    except (RequestException, ThingsBoardApiError) as exc:
+    except (RequestException, ThingsBoardApiError):
         snapshot = plan["snapshot"]
         dashboard_id = snapshot.get("dashboard_id") if isinstance(snapshot, dict) else None
-        if not isinstance(dashboard_id, str):
-            raise DashboardPublicationError("dashboard save response was lost") from exc
-        response = _exact_dashboard(client, dashboard_id)
-        if _dashboard_body_sha256(response) != plan["desired_body_sha256"]:
-            raise DashboardPublicationError("dashboard save response was lost and readback differs") from exc
+        if isinstance(dashboard_id, str):
+            response = _exact_dashboard(client, dashboard_id)
+        else:
+            candidates = _dashboard_candidates(client)
+            if len(candidates) != 1:
+                raise DashboardPublicationError(
+                    "dashboard save response was lost and discovery is ambiguous"
+                ) from None
+            response = candidates[0]
+        try:
+            _verify_saved_dashboard(
+                response,
+                desired_body_sha256=plan["desired_body_sha256"],
+                expected_dashboard_id=dashboard_id if isinstance(dashboard_id, str) else None,
+            )
+        except DashboardPublicationError:
+            raise DashboardPublicationError(
+                "dashboard save response was lost and readback differs"
+            ) from None
         recovered = True
     else:
         if not isinstance(response, dict):
             raise DashboardPublicationError("dashboard save response was not a JSON object")
         recovered = False
+    snapshot = plan["snapshot"]
+    expected_dashboard_id = snapshot.get("dashboard_id") if isinstance(snapshot, dict) else None
+    _verify_saved_dashboard(
+        response,
+        desired_body_sha256=plan["desired_body_sha256"],
+        expected_dashboard_id=expected_dashboard_id if isinstance(expected_dashboard_id, str) else None,
+    )
     receipt = _receipt(
         plan=plan,
         response=response,
