@@ -476,6 +476,23 @@ class DashboardTests(unittest.TestCase):
             {"latest", "timeseries", "alarm"},
             {widget["type"] for widget in configuration["widgets"].values()},
         )
+        table_widget = next(
+            widget
+            for widget in configuration["widgets"].values()
+            if widget["typeFullFqn"] == "system.cards.entities_table"
+        )
+        table_keys = {
+            (key["name"], key["type"])
+            for key in table_widget["config"]["datasources"][0]["dataKeys"]
+        }
+        self.assertIn(("equipment_id", "attribute"), table_keys)
+        self.assertIn(("cmms_asset_id", "attribute"), table_keys)
+        alarm_widget = next(
+            widget
+            for widget in configuration["widgets"].values()
+            if widget["typeFullFqn"] == "system.alarm_widgets.alarms_table"
+        )
+        self.assertEqual({}, alarm_widget["config"]["actions"])
 
 
 if __name__ == "__main__":

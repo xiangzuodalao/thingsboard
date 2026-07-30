@@ -86,6 +86,8 @@ usage() {
   ./dev.sh ui-start
   ./dev.sh provision
   ./dev.sh dashboard
+  ./dev.sh dashboard-plan [--actor ACTOR]
+  ./dev.sh dashboard-apply --plan-sha256 SHA256 --confirm-sha256 SHA256
   ./dev.sh sim-start
   ./dev.sh up
   ./dev.sh down
@@ -1029,10 +1031,24 @@ run_provision() {
 }
 
 run_dashboard() {
+    load_env
+    if [[ "${TB_PDM_DASHBOARD_MANAGED_PUBLICATION:-false}" == "true" ]]; then
+        die "已启用受管仪表盘发布；请先运行 ./dev.sh dashboard-plan，再使用确认的哈希运行 ./dev.sh dashboard-apply。"
+    fi
     require_backend_ready
     [[ -f "${RUNTIME_DIR}/devices.json" ]] ||
         die "设备尚未建档；请先运行 ./dev.sh provision。"
     sim_cli dashboard
+}
+
+run_dashboard_plan() {
+    require_backend_ready
+    sim_cli dashboard-plan "$@"
+}
+
+run_dashboard_apply() {
+    require_backend_ready
+    sim_cli dashboard-apply "$@"
 }
 
 run_sim_start() {
@@ -1124,7 +1140,11 @@ run_up() {
     run_backend_start
     run_ui_start
     run_provision
-    run_dashboard
+    if [[ "${TB_PDM_DASHBOARD_MANAGED_PUBLICATION:-false}" == "true" ]]; then
+        log "已跳过受管预测性维护仪表盘发布；请在审查后运行 dashboard-plan/dashboard-apply。"
+    else
+        run_dashboard
+    fi
     run_sim_start
     sim_cli verify
     log "全部服务已启动。前端：http://127.0.0.1:${UI_PORT}"
@@ -1301,6 +1321,8 @@ main() {
         ui-start) [[ $# -eq 0 ]] || die "ui-start 不接受参数。"; run_ui_start ;;
         provision) [[ $# -eq 0 ]] || die "provision 不接受参数。"; run_provision ;;
         dashboard) [[ $# -eq 0 ]] || die "dashboard 不接受参数。"; run_dashboard ;;
+        dashboard-plan) run_dashboard_plan "$@" ;;
+        dashboard-apply) run_dashboard_apply "$@" ;;
         sim-start) [[ $# -eq 0 ]] || die "sim-start 不接受参数。"; run_sim_start ;;
         up) [[ $# -eq 0 ]] || die "up 不接受参数。"; run_up ;;
         down) [[ $# -eq 0 ]] || die "down 不接受参数。"; run_down ;;

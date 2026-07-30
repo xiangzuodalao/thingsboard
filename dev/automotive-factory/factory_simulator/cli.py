@@ -29,6 +29,11 @@ from requests import RequestException
 
 from .api import ThingsBoardApi, ThingsBoardApiError, provision_devices
 from .config import AppConfig, ConfigError, applicable_faults, load_config
+from .dashboard_publication import (
+    DashboardPublicationError,
+    apply_dashboard_plan,
+    create_dashboard_plan,
+)
 from .engine import (
     FactorySimulator,
     SimulatorError,
@@ -131,11 +136,33 @@ def _cmd_provision(config: AppConfig, _args: argparse.Namespace) -> int:
 
 
 def _cmd_dashboard(config: AppConfig, _args: argparse.Namespace) -> int:
+    if os.environ.get("TB_PDM_DASHBOARD_MANAGED_PUBLICATION", "false").lower() == "true":
+        raise DashboardPublicationError(
+            "managed publication is enabled; use dashboard-plan then dashboard-apply"
+        )
     # Imported lazily so configuration validation and simulation do not depend
     # on dashboard provisioning internals.
     from .dashboard import provision_dashboard
 
     provision_dashboard(config)
+    return 0
+
+
+def _cmd_dashboard_plan(config: AppConfig, args: argparse.Namespace) -> int:
+    result = create_dashboard_plan(config, actor=args.actor)
+    print(f"Dashboard plan SHA-256: {result.sha256}")
+    print(f"Expires at: 30 minutes after creation; correlation ID is recorded in the plan.")
+    return 0
+
+
+def _cmd_dashboard_apply(config: AppConfig, args: argparse.Namespace) -> int:
+    receipt = apply_dashboard_plan(
+        config,
+        plan_sha256=args.plan_sha256,
+        confirmed_sha256=args.confirm_sha256,
+    )
+    outcome = "saved" if receipt["saved"] else "already matched"
+    print(f"Dashboard apply {outcome}; receipt saved with plan SHA-256 {receipt['plan_sha256']}")
     return 0
 
 
@@ -629,6 +656,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dashboard_parser.set_defaults(handler=_cmd_dashboard)
 
+    dashboard_plan_parser = subparsers.add_parser(
+        "dashboard-plan", help="write a read-only, 30-minute managed dashboard plan"
+    )
+    dashboard_plan_parser.add_argument(
+        "--actor", help="human operator recorded in the dashboard plan"
+    )
+    dashboard_plan_parser.set_defaults(handler=_cmd_dashboard_plan)
+
+    dashboard_apply_parser = subparsers.add_parser(
+        "dashboard-apply", help="apply one later-confirmed managed dashboard plan"
+    )
+    dashboard_apply_parser.add_argument("--plan-sha256", required=True)
+    dashboard_apply_parser.add_argument("--confirm-sha256", required=True)
+    dashboard_apply_parser.set_defaults(handler=_cmd_dashboard_apply)
+
     run_parser = subparsers.add_parser(
         "run", help="run all configured MQTT device simulators in the foreground"
     )
@@ -695,6 +737,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (
         ConfigError,
         ThingsBoardApiError,
+        DashboardPublicationError,
         SimulatorError,
         RequestException,
         OSError,

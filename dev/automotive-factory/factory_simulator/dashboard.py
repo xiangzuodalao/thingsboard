@@ -179,6 +179,12 @@ def _device_table_config(
                             "device_type", "设备类型", "#5C6BC0", key_type="attribute"
                         ),
                         _table_key("line_id", "产线", "#26A69A", key_type="attribute"),
+                        _table_key(
+                            "equipment_id", "设备编号", "#546E7A", key_type="attribute"
+                        ),
+                        _table_key(
+                            "cmms_asset_id", "CMMS 资产编号", "#78909C", key_type="attribute"
+                        ),
                         _table_key("operating_state", "运行状态", "#42A5F5"),
                         _table_key("online", "在线", "#66BB6A"),
                         _table_key("load_pct", "负载", "#FFA726", units="%", decimals=1),

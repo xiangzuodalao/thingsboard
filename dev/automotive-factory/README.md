@@ -74,7 +74,9 @@ tenant@thingsboard.org / tenant
 | `./dev.sh backend-start` | 后台启动本机 ThingsBoard，日志写入 `.runtime` |
 | `./dev.sh ui-start` | 后台启动 Angular 开发服务器和热更新 |
 | `./dev.sh provision` | 创建或复用 20 台设备并刷新本地 Token 文件 |
-| `./dev.sh dashboard` | 创建或更新基础工厂仪表盘 |
+| `./dev.sh dashboard` | 仅非受管本地模式：创建或更新基础工厂仪表盘 |
+| `./dev.sh dashboard-plan [--actor ACTOR]` | 只读生成预测性维护仪表盘的 30 分钟受管发布计划，并输出 SHA-256 |
+| `./dev.sh dashboard-apply --plan-sha256 SHA256 --confirm-sha256 SHA256` | 仅用同一计划哈希的后续明确确认发布一次仪表盘 |
 | `./dev.sh sim-start` | 启动 20 个使用独立 Token 的 MQTT 客户端 |
 | `./dev.sh up` | 执行完整构建和启动流程 |
 | `./dev.sh down` | 停止模拟器、UI、后端和数据库，保留数据库卷 |
@@ -221,3 +223,17 @@ tenant@thingsboard.org / tenant
 ```
 
 `reset` 不删除 `.env`、`.venv` 或 Maven 构建产物。重置后重新执行 `./dev.sh up` 即可创建全新环境。
+
+## 预测性维护仪表盘发布
+
+试点仪表盘的设备表会以只读 Server Attribute 显示 `equipment_id` 与
+`cmms_asset_id`。模拟器不会生成或写入这两个标识；它们由后续经确认的
+设备建档流程提供。告警表不含操作按钮，本阶段也不会变更告警。
+
+默认 `.env.example` 通过 `TB_PDM_DASHBOARD_MANAGED_PUBLICATION=true` 启用受管
+发布。先通过只读身份发现确认租户 UUID，再将其复制到本地、未跟踪的 `.env`
+中的 `TB_PDM_EXPECTED_TENANT_ID`。之后执行 `dashboard-plan`，审查输出的计划
+哈希，并在另一个明确确认步骤将同一个值同时传给 `--plan-sha256` 和
+`--confirm-sha256`。计划仅有效 30 分钟；应用前会重新检查租户、仪表盘 ID、版本
+和内容哈希，且至多保存一次。计划和回执均为本地 `.runtime/` 中权限 `0600` 的
+无凭据文件。受管模式下旧的 `dashboard` 写命令会拒绝执行。
