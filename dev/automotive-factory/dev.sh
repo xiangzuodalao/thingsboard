@@ -86,8 +86,9 @@ usage() {
   ./dev.sh ui-start
   ./dev.sh provision
   ./dev.sh dashboard
-  ./dev.sh dashboard-plan [--actor ACTOR]
-  ./dev.sh dashboard-apply --plan-sha256 SHA256 --confirm-sha256 SHA256
+  ./dev.sh dashboard-plan --actor ACTOR --output /absolute/path/plan.json
+  ./dev.sh dashboard-apply --plan /absolute/path/plan.json --plan-hash SHA256 \
+    --confirmed-hash SHA256 --actor ACTOR --receipt /absolute/path/receipt.json
   ./dev.sh sim-start
   ./dev.sh up
   ./dev.sh down

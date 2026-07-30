@@ -149,17 +149,32 @@ def _cmd_dashboard(config: AppConfig, _args: argparse.Namespace) -> int:
 
 
 def _cmd_dashboard_plan(config: AppConfig, args: argparse.Namespace) -> int:
-    result = create_dashboard_plan(config, actor=args.actor)
+    result = create_dashboard_plan(
+        config,
+        actor=args.actor,
+        output_path=args.output,
+    )
+    print(f"Tenant: {result.tenant_id}")
+    print(
+        "Current dashboard: "
+        f"id={result.current_dashboard_id or 'absent'} "
+        f"version={result.current_version if result.current_version is not None else 'absent'} "
+        f"body_sha256={result.current_body_sha256 or 'absent'}"
+    )
+    print(f"Desired dashboard body SHA-256: {result.desired_body_sha256}")
     print(f"Dashboard plan SHA-256: {result.sha256}")
-    print(f"Expires at: 30 minutes after creation; correlation ID is recorded in the plan.")
+    print("Expires at: 30 minutes after creation; correlation ID is recorded in the plan.")
     return 0
 
 
 def _cmd_dashboard_apply(config: AppConfig, args: argparse.Namespace) -> int:
     receipt = apply_dashboard_plan(
         config,
-        plan_sha256=args.plan_sha256,
-        confirmed_sha256=args.confirm_sha256,
+        plan_path=args.plan,
+        plan_sha256=args.plan_hash,
+        confirmed_sha256=args.confirmed_hash,
+        actor=args.actor,
+        receipt_path=args.receipt,
     )
     outcome = "saved" if receipt["saved"] else "already matched"
     print(f"Dashboard apply {outcome}; receipt saved with plan SHA-256 {receipt['plan_sha256']}")
@@ -660,15 +675,28 @@ def build_parser() -> argparse.ArgumentParser:
         "dashboard-plan", help="write a read-only, 30-minute managed dashboard plan"
     )
     dashboard_plan_parser.add_argument(
-        "--actor", help="human operator recorded in the dashboard plan"
+        "--actor", required=True, help="human operator recorded in the dashboard plan"
+    )
+    dashboard_plan_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="absolute path for the immutable canonical plan",
     )
     dashboard_plan_parser.set_defaults(handler=_cmd_dashboard_plan)
 
     dashboard_apply_parser = subparsers.add_parser(
         "dashboard-apply", help="apply one later-confirmed managed dashboard plan"
     )
-    dashboard_apply_parser.add_argument("--plan-sha256", required=True)
-    dashboard_apply_parser.add_argument("--confirm-sha256", required=True)
+    dashboard_apply_parser.add_argument(
+        "--plan", type=Path, required=True, help="absolute canonical plan path"
+    )
+    dashboard_apply_parser.add_argument("--plan-hash", required=True)
+    dashboard_apply_parser.add_argument("--confirmed-hash", required=True)
+    dashboard_apply_parser.add_argument("--actor", required=True)
+    dashboard_apply_parser.add_argument(
+        "--receipt", type=Path, required=True, help="absolute immutable receipt path"
+    )
     dashboard_apply_parser.set_defaults(handler=_cmd_dashboard_apply)
 
     run_parser = subparsers.add_parser(

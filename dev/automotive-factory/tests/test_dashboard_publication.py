@@ -200,6 +200,7 @@ class DashboardPublicationTests(unittest.TestCase):
         )
 
     def _plan(self, api: RecordingApi):
+        (self.config.runtime_dir / "pdm-dashboard-plan.json").unlink(missing_ok=True)
         return create_dashboard_plan(
             self.config,
             api=api,
@@ -229,6 +230,158 @@ class DashboardPublicationTests(unittest.TestCase):
         )
         self.assertEqual(plan["desired_body_sha256"], result.desired_body_sha256)
         self.assertNotIn("token", json.dumps(plan).lower())
+
+    def test_plan_writes_only_to_the_explicit_absolute_output(self) -> None:
+        api = RecordingApi(_existing_dashboard())
+        artifact_dir = Path(self.temporary_directory.name) / "plans"
+        artifact_dir.mkdir(mode=0o700)
+        output = artifact_dir / "phase2-dashboard.json"
+
+        result = create_dashboard_plan(
+            self.config,
+            api=api,
+            actor="dashboard-reviewer",
+            output_path=output,
+            now=NOW,
+            correlation_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        )
+
+        self.assertEqual(output, result.path)
+        self.assertEqual({"GET"}, set(api.calls))
+        self.assertEqual(0o600, stat.S_IMODE(output.stat().st_mode))
+        payload = json.loads(output.read_text(encoding="utf-8"))
+        expected_bytes = (
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
+        )
+        self.assertEqual(expected_bytes, output.read_bytes())
+        self.assertFalse((self.config.runtime_dir / "pdm-dashboard-plan.json").exists())
+
+    def test_plan_rejects_symlink_alias_and_unsafe_parent_before_provider_reads(self) -> None:
+        api = RecordingApi(_existing_dashboard())
+        artifact_dir = Path(self.temporary_directory.name) / "plans"
+        artifact_dir.mkdir(mode=0o700)
+        target = artifact_dir / "target.json"
+        target.write_text("unchanged", encoding="utf-8")
+        alias = artifact_dir / "alias.json"
+        alias.symlink_to(target)
+
+        with self.assertRaisesRegex(DashboardPublicationError, "safe artifact path"):
+            create_dashboard_plan(
+                self.config,
+                api=api,
+                actor="dashboard-reviewer",
+                output_path=alias,
+                now=NOW,
+            )
+        self.assertEqual([], api.calls)
+
+        read_only_dir = Path(self.temporary_directory.name) / "read-only"
+        read_only_dir.mkdir(mode=0o700)
+        read_only_dir.chmod(0o500)
+        self.addCleanup(read_only_dir.chmod, 0o700)
+        with self.assertRaisesRegex(DashboardPublicationError, "safe artifact path"):
+            create_dashboard_plan(
+                self.config,
+                api=api,
+                actor="dashboard-reviewer",
+                output_path=read_only_dir / "plan.json",
+                now=NOW,
+            )
+        self.assertEqual([], api.calls)
+
+        with self.assertRaisesRegex(DashboardPublicationError, "safe artifact path"):
+            create_dashboard_plan(
+                self.config,
+                api=api,
+                actor="dashboard-reviewer",
+                output_path=Path(self.temporary_directory.name)
+                / "missing"
+                / "plan.json",
+                now=NOW,
+            )
+        self.assertEqual([], api.calls)
+        self.assertEqual("unchanged", target.read_text(encoding="utf-8"))
+
+        unsafe_dir = Path(self.temporary_directory.name) / "unsafe"
+        unsafe_dir.mkdir(mode=0o700)
+        unsafe_dir.chmod(0o777)
+        with self.assertRaisesRegex(DashboardPublicationError, "safe artifact path"):
+            create_dashboard_plan(
+                self.config,
+                api=api,
+                actor="dashboard-reviewer",
+                output_path=unsafe_dir / "plan.json",
+                now=NOW,
+            )
+        self.assertEqual([], api.calls)
+
+    def test_cli_exposes_the_exact_phase2_plan_and_apply_artifact_contract(self) -> None:
+        api = RecordingApi(_existing_dashboard())
+        plans_dir = Path(self.temporary_directory.name) / "plans"
+        receipts_dir = Path(self.temporary_directory.name) / "receipts"
+        plans_dir.mkdir(mode=0o700)
+        receipts_dir.mkdir(mode=0o700)
+        plan_path = plans_dir / "phase2-dashboard.json"
+        receipt_path = receipts_dir / "phase2-dashboard.json"
+        plan_output = io.StringIO()
+
+        with patch(
+            "factory_simulator.dashboard_publication._managed_api",
+            return_value=api,
+        ):
+            with contextlib.redirect_stdout(plan_output):
+                plan_exit = main(
+                    [
+                        "--config",
+                        str(CONFIG_PATH),
+                        "dashboard-plan",
+                        "--actor",
+                        "phase2-operator",
+                        "--output",
+                        str(plan_path),
+                    ]
+                )
+
+        self.assertEqual(0, plan_exit)
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        self.assertIn(TENANT_ID, plan_output.getvalue())
+        self.assertIn(plan["snapshot"]["body_sha256"], plan_output.getvalue())
+        self.assertIn(plan["desired_body_sha256"], plan_output.getvalue())
+        self.assertIn(plan["plan_sha256"], plan_output.getvalue())
+
+        with patch(
+            "factory_simulator.dashboard_publication._managed_api",
+            return_value=api,
+        ):
+            apply_exit = main(
+                [
+                    "--config",
+                    str(CONFIG_PATH),
+                    "dashboard-apply",
+                    "--plan",
+                    str(plan_path),
+                    "--plan-hash",
+                    plan["plan_sha256"],
+                    "--confirmed-hash",
+                    plan["plan_sha256"],
+                    "--actor",
+                    "phase2-operator",
+                    "--receipt",
+                    str(receipt_path),
+                ]
+            )
+
+        self.assertEqual(0, apply_exit)
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual("phase2-operator", receipt["actor"])
+        self.assertEqual(0o600, stat.S_IMODE(receipt_path.stat().st_mode))
+        self.assertNotIn("token", json.dumps(receipt).lower())
 
     def test_plan_uses_the_preauthenticated_bearer_at_the_real_request_boundary(self) -> None:
         recorder = RequestRecorder()
@@ -276,7 +429,17 @@ class DashboardPublicationTests(unittest.TestCase):
             side_effect=ThingsBoardApiError(leaked),
         ):
             with contextlib.redirect_stderr(output):
-                exit_code = main(["--config", str(CONFIG_PATH), "dashboard-plan"])
+                exit_code = main(
+                    [
+                        "--config",
+                        str(CONFIG_PATH),
+                        "dashboard-plan",
+                        "--actor",
+                        "dashboard-reviewer",
+                        "--output",
+                        str(Path(self.temporary_directory.name) / "plan.json"),
+                    ]
+                )
         self.assertEqual(1, exit_code)
         self.assertNotIn("very-secret-token", output.getvalue())
 
@@ -294,6 +457,146 @@ class DashboardPublicationTests(unittest.TestCase):
             )
 
         self.assertNotIn("POST", api.calls)
+
+    def test_apply_requires_exact_lowercase_sha256_values(self) -> None:
+        api = RecordingApi(_existing_dashboard())
+        plan = self._plan(api)
+        api.calls.clear()
+
+        with self.assertRaisesRegex(DashboardPublicationError, "lowercase SHA-256"):
+            apply_dashboard_plan(
+                self.config,
+                plan_sha256=plan.sha256.upper(),
+                confirmed_sha256=plan.sha256.upper(),
+                api=api,
+                now=NOW + timedelta(minutes=1),
+            )
+
+        self.assertEqual([], api.calls)
+
+        with self.assertRaisesRegex(DashboardPublicationError, "lowercase SHA-256"):
+            apply_dashboard_plan(
+                self.config,
+                plan_sha256=None,  # type: ignore[arg-type]
+                confirmed_sha256=None,  # type: ignore[arg-type]
+                api=api,
+                now=NOW + timedelta(minutes=1),
+            )
+        self.assertEqual([], api.calls)
+
+    def test_apply_rejects_the_plan_at_its_exact_expiry_before_provider_reads(self) -> None:
+        api = RecordingApi(_existing_dashboard())
+        plan = self._plan(api)
+        api.calls.clear()
+
+        with self.assertRaisesRegex(DashboardPublicationError, "expired"):
+            apply_dashboard_plan(
+                self.config,
+                plan_sha256=plan.sha256,
+                confirmed_sha256=plan.sha256,
+                api=api,
+                now=NOW + timedelta(minutes=30),
+            )
+
+        self.assertEqual([], api.calls)
+
+    def test_explicit_apply_rejects_path_aliases_before_posting(self) -> None:
+        api = RecordingApi(_existing_dashboard())
+        artifact_dir = Path(self.temporary_directory.name) / "artifacts"
+        artifact_dir.mkdir(mode=0o700)
+        (artifact_dir / "child").mkdir(mode=0o700)
+        plan_path = artifact_dir / "phase2-dashboard.json"
+        plan = create_dashboard_plan(
+            self.config,
+            api=api,
+            actor="dashboard-reviewer",
+            output_path=plan_path,
+            now=NOW,
+        )
+        api.calls.clear()
+
+        with self.assertRaisesRegex(DashboardPublicationError, "distinct"):
+            apply_dashboard_plan(
+                self.config,
+                plan_path=plan_path,
+                receipt_path=artifact_dir / "child" / ".." / "phase2-dashboard.json",
+                plan_sha256=plan.sha256,
+                confirmed_sha256=plan.sha256,
+                actor="dashboard-applier",
+                api=api,
+                now=NOW + timedelta(minutes=1),
+            )
+
+        self.assertEqual([], api.calls)
+
+    def test_apply_consumes_the_plan_even_when_a_different_receipt_is_requested(self) -> None:
+        api = RecordingApi(_existing_dashboard())
+        plans_dir = Path(self.temporary_directory.name) / "plans"
+        receipts_dir = Path(self.temporary_directory.name) / "receipts"
+        plans_dir.mkdir(mode=0o700)
+        receipts_dir.mkdir(mode=0o700)
+        plan_path = plans_dir / "phase2-dashboard.json"
+        plan = create_dashboard_plan(
+            self.config,
+            api=api,
+            actor="dashboard-reviewer",
+            output_path=plan_path,
+            now=NOW,
+        )
+        first_receipt = receipts_dir / "first.json"
+        apply_dashboard_plan(
+            self.config,
+            plan_path=plan_path,
+            receipt_path=first_receipt,
+            plan_sha256=plan.sha256,
+            confirmed_sha256=plan.sha256,
+            actor="dashboard-applier",
+            api=api,
+            now=NOW + timedelta(minutes=1),
+        )
+        posts_after_first_apply = api.calls.count("POST")
+
+        with self.assertRaisesRegex(DashboardPublicationError, "consumed"):
+            apply_dashboard_plan(
+                self.config,
+                plan_path=plan_path,
+                receipt_path=receipts_dir / "second.json",
+                plan_sha256=plan.sha256,
+                confirmed_sha256=plan.sha256,
+                actor="dashboard-applier",
+                api=api,
+                now=NOW + timedelta(minutes=2),
+            )
+
+        self.assertEqual(posts_after_first_apply, api.calls.count("POST"))
+
+    def test_apply_rejects_a_receipt_path_that_aliases_its_consumption_marker(self) -> None:
+        api = RecordingApi(_existing_dashboard())
+        plans_dir = Path(self.temporary_directory.name) / "plans"
+        plans_dir.mkdir(mode=0o700)
+        plan_path = plans_dir / "phase2-dashboard.json"
+        plan = create_dashboard_plan(
+            self.config,
+            api=api,
+            actor="dashboard-reviewer",
+            output_path=plan_path,
+            now=NOW,
+        )
+        api.calls.clear()
+
+        with self.assertRaisesRegex(DashboardPublicationError, "distinct"):
+            apply_dashboard_plan(
+                self.config,
+                plan_path=plan_path,
+                receipt_path=plans_dir / ".phase2-dashboard.json.consumed",
+                plan_sha256=plan.sha256,
+                confirmed_sha256=plan.sha256,
+                actor="dashboard-applier",
+                api=api,
+                now=NOW + timedelta(minutes=1),
+            )
+
+        self.assertEqual([], api.calls)
 
     def test_apply_rechecks_tenant_dashboard_version_and_body_before_one_save(self) -> None:
         for mutation in ("tenant", "version", "body"):

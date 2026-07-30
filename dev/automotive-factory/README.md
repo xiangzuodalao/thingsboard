@@ -75,8 +75,8 @@ tenant@thingsboard.org / tenant
 | `./dev.sh ui-start` | 后台启动 Angular 开发服务器和热更新 |
 | `./dev.sh provision` | 创建或复用 20 台设备并刷新本地 Token 文件 |
 | `./dev.sh dashboard` | 仅非受管本地模式：创建或更新基础工厂仪表盘 |
-| `./dev.sh dashboard-plan [--actor ACTOR]` | 只读生成预测性维护仪表盘的 30 分钟受管发布计划，并输出 SHA-256 |
-| `./dev.sh dashboard-apply --plan-sha256 SHA256 --confirm-sha256 SHA256` | 仅用同一计划哈希的后续明确确认发布一次仪表盘 |
+| `./dev.sh dashboard-plan --actor ACTOR --output /absolute/path/plan.json` | 只读生成预测性维护仪表盘的 30 分钟受管发布计划，并将 canonical JSON 写入指定绝对路径 |
+| `./dev.sh dashboard-apply --plan /absolute/path/plan.json --plan-hash SHA256 --confirmed-hash SHA256 --actor ACTOR --receipt /absolute/path/receipt.json` | 仅用同一计划哈希的后续明确确认发布一次仪表盘，并将回执写入指定绝对路径 |
 | `./dev.sh sim-start` | 启动 20 个使用独立 Token 的 MQTT 客户端 |
 | `./dev.sh up` | 执行完整构建和启动流程 |
 | `./dev.sh down` | 停止模拟器、UI、后端和数据库，保留数据库卷 |
@@ -232,10 +232,13 @@ tenant@thingsboard.org / tenant
 
 默认 `.env.example` 通过 `TB_PDM_DASHBOARD_MANAGED_PUBLICATION=true` 启用受管
 发布。先通过只读身份发现确认租户 UUID，再将其复制到本地、未跟踪的 `.env`
-中的 `TB_PDM_EXPECTED_TENANT_ID`。之后执行 `dashboard-plan`，审查输出的计划
-哈希，并在另一个明确确认步骤将同一个值同时传给 `--plan-sha256` 和
-`--confirm-sha256`。计划仅有效 30 分钟；应用前会重新检查租户、仪表盘 ID、版本
-和内容哈希，且至多保存一次。计划和回执均为本地 `.runtime/` 中权限 `0600` 的
-无凭据文件。运行受管命令前，操作员必须通过外部环境提供已认证的
+中的 `TB_PDM_EXPECTED_TENANT_ID`。之后用必填的 `--actor` 和 `--output`
+执行 `dashboard-plan`，审查输出的租户、当前/目标内容哈希及计划哈希，并在另一个
+明确确认步骤将同一个 64 位小写 SHA-256 同时传给 `--plan-hash` 和
+`--confirmed-hash`。`dashboard-apply` 还必须显式指定原计划的 `--plan`、
+执行者 `--actor` 与新回执的 `--receipt`。计划仅有效 30 分钟；应用前会重新检查
+租户、仪表盘 ID、版本和内容哈希，且至多保存一次。计划、消费标记和回执均为权限
+`0600` 的无凭据 canonical JSON；目标必须是安全、互不相同且父目录已存在的绝对
+路径，已存在、符号链接或不安全父目录会被拒绝。运行受管命令前，操作员必须通过外部环境提供已认证的
 `TB_PDM_DASHBOARD_BEARER_TOKEN`；计划命令绝不执行登录请求，且该凭据不会写入
 计划、回执或错误输出。受管模式下旧的 `dashboard` 写命令会拒绝执行。
