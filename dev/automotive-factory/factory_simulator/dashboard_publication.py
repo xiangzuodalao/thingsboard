@@ -22,6 +22,7 @@ import copy
 import getpass
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -46,6 +47,8 @@ from .dashboard import (
 
 PLAN_FILENAME = "pdm-dashboard-plan.json"
 RECEIPT_FILENAME = "pdm-dashboard-receipt.json"
+_CONSUMPTION_NAMESPACE = ".pdm-dashboard-consumption"
+_MAX_PLAN_BYTES = 8 * 1024 * 1024
 PLAN_TTL = timedelta(minutes=30)
 _SERVER_MANAGED_FIELDS = frozenset({"id", "version", "createdTime", "tenantId"})
 _SENSITIVE_KEY_TERMS = (
@@ -57,6 +60,7 @@ _SENSITIVE_KEY_TERMS = (
     "secret",
     "apikey",
 )
+_MANAGED_CREDENTIAL_ENV_NAMES = ("TB_PDM_DASHBOARD_BEARER_TOKEN",)
 
 
 class DashboardPublicationError(RuntimeError):
@@ -75,13 +79,70 @@ class DashboardPlanResult:
     path: Path
 
 
-def _canonical_bytes(payload: dict[str, Any]) -> bytes:
-    return json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
+def _managed_credentials() -> tuple[str, ...]:
+    return tuple(
+        credential for name in _MANAGED_CREDENTIAL_ENV_NAMES if (credential := os.environ.get(name))
+    )
+
+
+def _validate_artifact_tree(payload: Any, *, context: str) -> None:
+    managed_credentials = _managed_credentials()
+    pending: list[Any] = [payload]
+    visited_containers: set[int] = set()
+    while pending:
+        value = pending.pop()
+        value_type = type(value)
+        if value_type is dict:
+            identity = id(value)
+            if identity in visited_containers:
+                continue
+            visited_containers.add(identity)
+            for key, nested in value.items():
+                if type(key) is not str:
+                    raise DashboardPublicationError(f"{context} is not canonical JSON")
+                if any(credential in key for credential in managed_credentials):
+                    raise DashboardPublicationError(f"{context} contains a credential-like value")
+                normalized = re.sub(r"[^a-z]", "", key.lower())
+                if any(term in normalized for term in _SENSITIVE_KEY_TERMS):
+                    raise DashboardPublicationError(f"{context} contains a credential-like value")
+                pending.append(nested)
+        elif value_type is list:
+            identity = id(value)
+            if identity in visited_containers:
+                continue
+            visited_containers.add(identity)
+            pending.extend(value)
+        elif value_type is str:
+            if (
+                any(credential in value for credential in managed_credentials)
+                or re.search(r"(?i)\bbearer\s+\S+", value)
+                or re.fullmatch(
+                    r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
+                    value,
+                )
+            ):
+                raise DashboardPublicationError(f"{context} contains a credential-like value")
+        elif value is None or value_type is bool or value_type is int:
+            continue
+        elif value_type is float:
+            if not math.isfinite(value):
+                raise DashboardPublicationError(f"{context} is not canonical JSON")
+        else:
+            raise DashboardPublicationError(f"{context} is not canonical JSON")
+
+
+def _canonical_bytes(payload: dict[str, Any], *, context: str = "publication artifact") -> bytes:
+    _validate_artifact_tree(payload, context=context)
+    try:
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, RecursionError):
+        raise DashboardPublicationError("publication artifact is not canonical JSON") from None
 
 
 def _sha256(payload: dict[str, Any]) -> str:
@@ -171,28 +232,6 @@ def _exact_dashboard(api: Any, dashboard_id: str) -> dict[str, Any]:
     return dashboard
 
 
-def _secret_free(payload: dict[str, Any], *, context: str) -> None:
-    def inspect(value: Any, path: str) -> None:
-        if isinstance(value, dict):
-            for key, nested in value.items():
-                if not isinstance(key, str):
-                    raise DashboardPublicationError(f"{context} contains a credential-like value")
-                normalized = re.sub(r"[^a-z]", "", key.lower())
-                if any(term in normalized for term in _SENSITIVE_KEY_TERMS):
-                    raise DashboardPublicationError(f"{context} contains a credential-like value")
-                inspect(nested, f"{path}.{key}")
-        elif isinstance(value, list):
-            for index, nested in enumerate(value):
-                inspect(nested, f"{path}[{index}]")
-        elif isinstance(value, str) and (
-            re.search(r"(?i)\bbearer\s+\S+", value)
-            or re.fullmatch(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", value)
-        ):
-            raise DashboardPublicationError(f"{context} contains a credential-like value")
-
-    inspect(payload, "$")
-
-
 def _actor(value: str | None, *, field: str, default: str | None = None) -> str:
     actor = value if value is not None else default
     if (
@@ -200,9 +239,11 @@ def _actor(value: str | None, *, field: str, default: str | None = None) -> str:
         or not actor
         or actor != actor.strip()
         or len(actor) > 128
-        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in actor)
+        or not actor.isprintable()
     ):
         raise DashboardPublicationError(f"{field} must be a non-empty operator name")
+    if any(credential in actor for credential in _managed_credentials()):
+        raise DashboardPublicationError(f"{field} must not match a managed credential")
     return actor
 
 
@@ -213,11 +254,7 @@ def _safe_artifact_path(
     context: str,
 ) -> Path:
     candidate = Path(path)
-    if (
-        not candidate.is_absolute()
-        or ".." in candidate.parts
-        or candidate.name in {"", ".", ".."}
-    ):
+    if not candidate.is_absolute() or ".." in candidate.parts or candidate.name in {"", ".", ".."}:
         raise DashboardPublicationError(f"{context} must use a safe artifact path")
     try:
         parent = candidate.parent
@@ -258,8 +295,17 @@ def _safe_artifact_path(
     return candidate
 
 
-def _write_owner_only(path: Path, payload: dict[str, Any], *, context: str) -> None:
-    _secret_free(payload, context=path.name)
+def _write_owner_only(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    context: str,
+    exists_error: str | None = None,
+    max_bytes: int | None = None,
+) -> None:
+    serialized = _canonical_bytes(payload, context=context) + b"\n"
+    if max_bytes is not None and len(serialized) > max_bytes:
+        raise DashboardPublicationError(f"{context} exceeds the size limit")
     temporary_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -267,8 +313,7 @@ def _write_owner_only(path: Path, payload: dict[str, Any], *, context: str) -> N
         ) as stream:
             temporary_path = Path(stream.name)
             os.chmod(temporary_path, 0o600)
-            stream.write(_canonical_bytes(payload))
-            stream.write(b"\n")
+            stream.write(serialized)
             stream.flush()
             os.fsync(stream.fileno())
     except OSError as exc:
@@ -284,7 +329,7 @@ def _write_owner_only(path: Path, payload: dict[str, Any], *, context: str) -> N
         finally:
             os.close(directory_fd)
     except FileExistsError:
-        raise DashboardPublicationError(f"{context} already exists") from None
+        raise DashboardPublicationError(exists_error or f"{context} already exists") from None
     except OSError as exc:
         raise DashboardPublicationError(f"{context} could not be written") from exc
     finally:
@@ -293,19 +338,66 @@ def _write_owner_only(path: Path, payload: dict[str, Any], *, context: str) -> N
 
 
 def _read_plan(path: Path) -> dict[str, Any]:
+    descriptor: int | None = None
     try:
-        raw = path.read_bytes()
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+    except OSError:
+        raise DashboardPublicationError(
+            "saved dashboard plan is not a safe dashboard plan file"
+        ) from None
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_nlink != 1
+        ):
+            raise DashboardPublicationError(
+                "saved dashboard plan is not a safe dashboard plan file"
+            )
+        if before.st_size > _MAX_PLAN_BYTES:
+            raise DashboardPublicationError("saved dashboard plan exceeds the size limit")
+        chunks: list[bytes] = []
+        remaining = _MAX_PLAN_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if (
+            len(raw) > _MAX_PLAN_BYTES
+            or after.st_dev != before.st_dev
+            or after.st_ino != before.st_ino
+            or after.st_size != len(raw)
+            or not stat.S_ISREG(after.st_mode)
+            or after.st_uid != os.geteuid()
+            or stat.S_IMODE(after.st_mode) != 0o600
+            or after.st_nlink != 1
+        ):
+            raise DashboardPublicationError("saved dashboard plan changed while it was being read")
+    except OSError:
+        raise DashboardPublicationError("saved dashboard plan is unavailable") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    try:
         payload = json.loads(raw.decode("utf-8"))
-    except OSError as exc:
-        raise DashboardPublicationError("saved dashboard plan is unavailable") from exc
     except UnicodeDecodeError as exc:
         raise DashboardPublicationError("saved dashboard plan is not valid JSON") from exc
     except json.JSONDecodeError as exc:
         raise DashboardPublicationError("saved dashboard plan is not valid JSON") from exc
+    except RecursionError:
+        raise DashboardPublicationError("saved dashboard plan is not valid JSON") from None
     if not isinstance(payload, dict):
         raise DashboardPublicationError("saved dashboard plan is not a JSON object")
-    _secret_free(payload, context=path.name)
-    if raw != _canonical_bytes(payload) + b"\n":
+    if raw != _canonical_bytes(payload, context="saved dashboard plan") + b"\n":
         raise DashboardPublicationError("saved dashboard plan is not canonical JSON")
     return payload
 
@@ -321,6 +413,65 @@ def _plan_path(config: AppConfig) -> Path:
 
 def _receipt_path(config: AppConfig) -> Path:
     return config.runtime_dir / RECEIPT_FILENAME
+
+
+def _ensure_owner_directory(
+    path: Path,
+    *,
+    context: str,
+    exact_mode: bool,
+) -> Path:
+    candidate = Path(path)
+    if not candidate.is_absolute() or ".." in candidate.parts or candidate.name in {"", ".", ".."}:
+        raise DashboardPublicationError(f"{context} is not owner-controlled")
+    try:
+        parent = candidate.parent
+        if parent.resolve(strict=True) != parent:
+            raise DashboardPublicationError(f"{context} is not owner-controlled")
+        parent_stat = parent.lstat()
+        parent_mode = stat.S_IMODE(parent_stat.st_mode)
+        if (
+            stat.S_ISLNK(parent_stat.st_mode)
+            or not stat.S_ISDIR(parent_stat.st_mode)
+            or parent_stat.st_uid != os.geteuid()
+            or parent_mode & 0o022
+            or parent_mode & 0o700 != 0o700
+        ):
+            raise DashboardPublicationError(f"{context} is not owner-controlled")
+        try:
+            os.mkdir(candidate, 0o700)
+        except FileExistsError:
+            pass
+        candidate_stat = candidate.lstat()
+        candidate_mode = stat.S_IMODE(candidate_stat.st_mode)
+        if (
+            stat.S_ISLNK(candidate_stat.st_mode)
+            or not stat.S_ISDIR(candidate_stat.st_mode)
+            or candidate_stat.st_uid != os.geteuid()
+            or candidate.resolve(strict=True) != candidate
+            or (exact_mode and candidate_mode != 0o700)
+            or (not exact_mode and (candidate_mode & 0o022 or candidate_mode & 0o700 != 0o700))
+        ):
+            raise DashboardPublicationError(f"{context} is not owner-controlled")
+    except DashboardPublicationError:
+        raise
+    except OSError:
+        raise DashboardPublicationError(f"{context} is not owner-controlled") from None
+    return candidate
+
+
+def _consumption_marker_path(config: AppConfig, plan_sha256: str) -> Path:
+    runtime_dir = _ensure_owner_directory(
+        config.runtime_dir,
+        context="dashboard runtime directory",
+        exact_mode=False,
+    )
+    namespace = _ensure_owner_directory(
+        runtime_dir / _CONSUMPTION_NAMESPACE,
+        context="dashboard consumption namespace",
+        exact_mode=True,
+    )
+    return namespace / f"{plan_sha256}.json"
 
 
 def _managed_api(config: AppConfig) -> ThingsBoardApi:
@@ -368,6 +519,7 @@ def create_dashboard_plan(
     else:
         path = Path(output_path)
     path = _safe_artifact_path(path, must_exist=False, context="dashboard plan output")
+    actor_name = _actor(actor, field="dashboard plan actor", default=getpass.getuser())
     client = api or _managed_api(config)
     created_at = _now_utc(now)
     tenant_id = _require_expected_tenant(client)
@@ -376,9 +528,13 @@ def create_dashboard_plan(
     if len(candidates) > 1:
         raise DashboardPublicationError("dashboard discovery is ambiguous")
     existing = candidates[0] if candidates else None
-    desired_dashboard = _dashboard_payload(
-        _dashboard_configuration(client, device_ids), existing
-    )
+    try:
+        desired_dashboard = _dashboard_payload(
+            _dashboard_configuration(client, device_ids),
+            existing,
+        )
+    except RecursionError:
+        raise DashboardPublicationError("dashboard provider data is too deeply nested") from None
     desired_body_sha256 = _dashboard_body_sha256(desired_dashboard)
     snapshot: dict[str, Any]
     if existing is None:
@@ -389,7 +545,6 @@ def create_dashboard_plan(
             "version": _dashboard_version(existing),
             "body_sha256": _dashboard_body_sha256(existing),
         }
-    actor_name = _actor(actor, field="dashboard plan actor", default=getpass.getuser())
     correlation = _canonical_uuid(correlation_id or str(uuid.uuid4()), field="correlation ID")
     plan = {
         "schema_version": 1,
@@ -404,7 +559,12 @@ def create_dashboard_plan(
     }
     plan_sha256 = _plan_sha256(plan)
     plan["plan_sha256"] = plan_sha256
-    _write_owner_only(path, plan, context="dashboard plan output")
+    _write_owner_only(
+        path,
+        plan,
+        context="dashboard plan output",
+        max_bytes=_MAX_PLAN_BYTES,
+    )
     return DashboardPlanResult(
         sha256=plan_sha256,
         tenant_id=tenant_id,
@@ -469,7 +629,9 @@ def _verify_saved_dashboard(
 ) -> None:
     response_id = _dashboard_id(response)
     if expected_dashboard_id is not None and response_id != expected_dashboard_id:
-        raise DashboardPublicationError("saved dashboard response does not match the planned dashboard ID")
+        raise DashboardPublicationError(
+            "saved dashboard response does not match the planned dashboard ID"
+        )
     if _dashboard_body_sha256(response) != desired_body_sha256:
         raise DashboardPublicationError("saved dashboard response does not match the desired body")
 
@@ -549,25 +711,16 @@ def apply_dashboard_plan(
     try:
         receipt_parent = selected_receipt_path.parent.resolve(strict=True)
     except OSError as exc:
-        raise DashboardPublicationError(
-            "dashboard receipt must use a safe artifact path"
-        ) from exc
+        raise DashboardPublicationError("dashboard receipt must use a safe artifact path") from exc
     if receipt_parent / selected_receipt_path.name == selected_plan_path:
         raise DashboardPublicationError(
             "dashboard plan and receipt must use distinct safe artifact paths"
-        )
-    consumed_path = selected_plan_path.with_name(f".{selected_plan_path.name}.consumed")
-    if receipt_parent / selected_receipt_path.name == consumed_path:
-        raise DashboardPublicationError(
-            "dashboard plan, receipt, and consumption marker must use distinct paths"
         )
     selected_receipt_path = _safe_artifact_path(
         selected_receipt_path,
         must_exist=False,
         context="dashboard receipt",
     )
-    if consumed_path.exists() or consumed_path.is_symlink():
-        raise DashboardPublicationError("saved dashboard plan has already been consumed")
 
     plan = _read_plan(selected_plan_path)
     actual_plan_sha256 = _plan_sha256(plan)
@@ -575,6 +728,21 @@ def apply_dashboard_plan(
         raise DashboardPublicationError("dashboard apply plan hash does not match the saved plan")
     if not sha256_pattern.fullmatch(actual_plan_sha256):
         raise DashboardPublicationError("saved dashboard plan hash is invalid")
+    consumed_path = _consumption_marker_path(config, actual_plan_sha256)
+    if receipt_parent / selected_receipt_path.name == consumed_path:
+        raise DashboardPublicationError(
+            "dashboard plan, receipt, and consumption marker must use distinct paths"
+        )
+    try:
+        consumed_path.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        raise DashboardPublicationError(
+            "saved dashboard plan consumption state is unavailable"
+        ) from None
+    else:
+        raise DashboardPublicationError("saved dashboard plan has already been consumed")
     applied_at = _now_utc(now)
     if applied_at >= _plan_expiry(plan):
         raise DashboardPublicationError("saved dashboard plan has expired")
@@ -597,6 +765,7 @@ def apply_dashboard_plan(
             "actor": applying_actor,
         },
         context="dashboard plan consumption marker",
+        exists_error="saved dashboard plan has already been consumed",
     )
     if current is not None and _dashboard_body_sha256(current) == plan["desired_body_sha256"]:
         receipt = _receipt(
@@ -649,9 +818,7 @@ def apply_dashboard_plan(
         response,
         desired_body_sha256=plan["desired_body_sha256"],
         expected_dashboard_id=(
-            expected_dashboard_id
-            if isinstance(expected_dashboard_id, str)
-            else None
+            expected_dashboard_id if isinstance(expected_dashboard_id, str) else None
         ),
     )
     receipt = _receipt(

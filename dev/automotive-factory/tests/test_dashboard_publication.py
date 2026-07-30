@@ -17,12 +17,16 @@
 from __future__ import annotations
 
 import copy
+import concurrent.futures
 import contextlib
 import io
 import json
 import os
 import stat
+import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -31,6 +35,7 @@ from unittest.mock import patch
 
 from requests import ConnectionError
 
+from factory_simulator import dashboard_publication
 from factory_simulator.api import ThingsBoardApi, ThingsBoardApiError
 from factory_simulator.cli import _cmd_dashboard, main
 from factory_simulator.config import load_config
@@ -132,7 +137,9 @@ def _existing_dashboard() -> dict[str, object]:
 
 
 class _Response:
-    def __init__(self, payload: dict[str, object], *, ok: bool = True, status_code: int = 200, text: str = "") -> None:
+    def __init__(
+        self, payload: dict[str, object], *, ok: bool = True, status_code: int = 200, text: str = ""
+    ) -> None:
         self.payload = payload
         self.ok = ok
         self.status_code = status_code
@@ -172,9 +179,7 @@ class RequestRecorder:
                     {"settings": {}, "alarmSource": {"dataKeys": []}},
                 ),
             }[fqn]
-            return _Response(
-                {"descriptor": {"type": widget_type, "defaultConfig": default_config}}
-            )
+            return _Response({"descriptor": {"type": widget_type, "defaultConfig": default_config}})
         raise AssertionError(f"unexpected URL: {url}")
 
 
@@ -209,6 +214,137 @@ class DashboardPublicationTests(unittest.TestCase):
             correlation_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
         )
 
+    def _api_with_provider_default(self, value: object) -> RecordingApi:
+        api = RecordingApi(_existing_dashboard())
+        get_widget_type = api.get_widget_type
+
+        def inject_provider_value(fqn: str) -> dict[str, object]:
+            response = get_widget_type(fqn)
+            if fqn == "system.cards.entities_table":
+                response["descriptor"]["defaultConfig"]["providerValue"] = value  # type: ignore[index]
+            return response
+
+        api.get_widget_type = inject_provider_value  # type: ignore[method-assign]
+        return api
+
+    def test_plan_writer_rejects_nonfinite_provider_values_before_creating_a_file(
+        self,
+    ) -> None:
+        for index, value in enumerate((float("nan"), float("inf"), float("-inf"))):
+            with self.subTest(value=value):
+                artifact_dir = Path(self.temporary_directory.name) / f"nonfinite-{index}"
+                artifact_dir.mkdir(mode=0o700)
+                output_path = artifact_dir / "plan.json"
+                api = self._api_with_provider_default(value)
+
+                with self.assertRaisesRegex(
+                    DashboardPublicationError,
+                    "canonical JSON",
+                ):
+                    create_dashboard_plan(
+                        self.config,
+                        api=api,
+                        actor="dashboard-reviewer",
+                        output_path=output_path,
+                        now=NOW,
+                    )
+
+                self.assertEqual([], list(artifact_dir.iterdir()))
+                self.assertEqual({"GET"}, set(api.calls))
+
+    def test_plan_writer_rejects_oversized_provider_data_before_creating_a_file(
+        self,
+    ) -> None:
+        artifact_dir = Path(self.temporary_directory.name) / "oversized-writer"
+        artifact_dir.mkdir(mode=0o700)
+        output_path = artifact_dir / "plan.json"
+        api = self._api_with_provider_default("x" * (8 * 1024 * 1024))
+
+        with self.assertRaisesRegex(DashboardPublicationError, "size limit"):
+            create_dashboard_plan(
+                self.config,
+                api=api,
+                actor="dashboard-reviewer",
+                output_path=output_path,
+                now=NOW,
+            )
+
+        self.assertEqual([], list(artifact_dir.iterdir()))
+        self.assertEqual({"GET"}, set(api.calls))
+
+    def test_plan_writer_rejects_a_tuple_wrapped_managed_bearer_before_writes(
+        self,
+    ) -> None:
+        artifact_dir = Path(self.temporary_directory.name) / "tuple-bearer-writer"
+        artifact_dir.mkdir(mode=0o700)
+        output_path = artifact_dir / "plan.json"
+        opaque_bearer = "opaque-provider-credential-68b51a2c"
+        api = self._api_with_provider_default((f"prefix:{opaque_bearer}:suffix",))
+
+        with patch.dict(
+            os.environ,
+            {"TB_PDM_DASHBOARD_BEARER_TOKEN": opaque_bearer},
+            clear=False,
+        ):
+            with self.assertRaises(DashboardPublicationError) as raised:
+                create_dashboard_plan(
+                    self.config,
+                    api=api,
+                    actor="dashboard-reviewer",
+                    output_path=output_path,
+                    now=NOW,
+                )
+
+        self.assertNotIn(opaque_bearer, str(raised.exception))
+        self.assertEqual([], list(artifact_dir.iterdir()))
+        self.assertEqual({"GET"}, set(api.calls))
+
+    def test_cli_maps_deep_provider_default_recursion_to_a_stable_error_before_writes(
+        self,
+    ) -> None:
+        artifact_dir = Path(self.temporary_directory.name) / "deep-provider-writer"
+        artifact_dir.mkdir(mode=0o700)
+        output_path = artifact_dir / "plan.json"
+        opaque_bearer = "opaque-deep-provider-credential-6c4b31e2"
+        provider_value: object = f"prefix:{opaque_bearer}:suffix"
+        for _ in range(1200):
+            provider_value = [provider_value]
+        api = self._api_with_provider_default(provider_value)
+        error_output = io.StringIO()
+
+        with patch.dict(
+            os.environ,
+            {"TB_PDM_DASHBOARD_BEARER_TOKEN": opaque_bearer},
+            clear=False,
+        ):
+            with patch(
+                "factory_simulator.dashboard_publication._managed_api",
+                return_value=api,
+            ):
+                with contextlib.redirect_stderr(error_output):
+                    try:
+                        exit_code: int | str = main(
+                            [
+                                "--config",
+                                str(CONFIG_PATH),
+                                "dashboard-plan",
+                                "--actor",
+                                "dashboard-reviewer",
+                                "--output",
+                                str(output_path),
+                            ]
+                        )
+                    except RecursionError:
+                        exit_code = "uncaught recursion"
+
+        self.assertEqual(1, exit_code)
+        self.assertIn("ERROR:", error_output.getvalue())
+        self.assertNotIn("Traceback", error_output.getvalue())
+        self.assertNotIn("RecursionError", error_output.getvalue())
+        self.assertNotIn(opaque_bearer, error_output.getvalue())
+        self.assertEqual([], list(artifact_dir.iterdir()))
+        self.assertEqual({"GET"}, set(api.calls))
+
     def test_plan_is_get_only_and_writes_a_secret_free_canonical_expiring_record(self) -> None:
         api = RecordingApi(_existing_dashboard())
 
@@ -225,9 +361,7 @@ class DashboardPublicationTests(unittest.TestCase):
         self.assertEqual(7, plan["snapshot"]["version"])
         self.assertEqual("dashboard-reviewer", plan["actor"])
         self.assertEqual("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", plan["correlation_id"])
-        self.assertEqual(
-            (NOW + timedelta(minutes=30)).isoformat(), plan["expires_at"]
-        )
+        self.assertEqual((NOW + timedelta(minutes=30)).isoformat(), plan["expires_at"])
         self.assertEqual(plan["desired_body_sha256"], result.desired_body_sha256)
         self.assertNotIn("token", json.dumps(plan).lower())
 
@@ -300,9 +434,7 @@ class DashboardPublicationTests(unittest.TestCase):
                 self.config,
                 api=api,
                 actor="dashboard-reviewer",
-                output_path=Path(self.temporary_directory.name)
-                / "missing"
-                / "plan.json",
+                output_path=Path(self.temporary_directory.name) / "missing" / "plan.json",
                 now=NOW,
             )
         self.assertEqual([], api.calls)
@@ -329,6 +461,9 @@ class DashboardPublicationTests(unittest.TestCase):
         receipts_dir.mkdir(mode=0o700)
         plan_path = plans_dir / "phase2-dashboard.json"
         receipt_path = receipts_dir / "phase2-dashboard.json"
+        cli_config_path = Path(self.temporary_directory.name) / "config.yml"
+        cli_config_path.write_bytes(CONFIG_PATH.read_bytes())
+        cli_config_path.chmod(0o600)
         plan_output = io.StringIO()
 
         with patch(
@@ -339,7 +474,7 @@ class DashboardPublicationTests(unittest.TestCase):
                 plan_exit = main(
                     [
                         "--config",
-                        str(CONFIG_PATH),
+                        str(cli_config_path),
                         "dashboard-plan",
                         "--actor",
                         "phase2-operator",
@@ -362,7 +497,7 @@ class DashboardPublicationTests(unittest.TestCase):
             apply_exit = main(
                 [
                     "--config",
-                    str(CONFIG_PATH),
+                    str(cli_config_path),
                     "dashboard-apply",
                     "--plan",
                     str(plan_path),
@@ -405,7 +540,66 @@ class DashboardPublicationTests(unittest.TestCase):
 
         self.assertTrue(recorder.methods)
         self.assertEqual({"GET"}, set(recorder.methods))
-        self.assertNotIn("preauthenticated-secret", (self.config.runtime_dir / "pdm-dashboard-plan.json").read_text())
+        self.assertNotIn(
+            "preauthenticated-secret",
+            (self.config.runtime_dir / "pdm-dashboard-plan.json").read_text(),
+        )
+
+    def test_plan_rejects_an_opaque_managed_bearer_as_actor_without_leaking_it(
+        self,
+    ) -> None:
+        api = RecordingApi(_existing_dashboard())
+        opaque_bearer = "opaque-dashboard-credential-04f8a621"
+        plan_path = self.config.runtime_dir / "pdm-dashboard-plan.json"
+
+        with patch.dict(
+            os.environ,
+            {"TB_PDM_DASHBOARD_BEARER_TOKEN": opaque_bearer},
+            clear=False,
+        ):
+            with self.assertRaises(DashboardPublicationError) as raised:
+                create_dashboard_plan(
+                    self.config,
+                    api=api,
+                    actor=opaque_bearer,
+                    now=NOW,
+                )
+
+        self.assertNotIn(opaque_bearer, str(raised.exception))
+        self.assertFalse(plan_path.exists())
+
+    def test_plan_rejects_an_actor_containing_the_complete_managed_bearer(
+        self,
+    ) -> None:
+        api = RecordingApi(_existing_dashboard())
+        opaque_bearer = "opaque-dashboard-credential-a1425c90"
+        actor = f"reviewer:{opaque_bearer}:phase2"
+        plan_path = self.config.runtime_dir / "pdm-dashboard-plan.json"
+
+        with patch.dict(
+            os.environ,
+            {"TB_PDM_DASHBOARD_BEARER_TOKEN": opaque_bearer},
+            clear=False,
+        ):
+            with self.assertRaises(DashboardPublicationError) as raised:
+                create_dashboard_plan(
+                    self.config,
+                    api=api,
+                    actor=actor,
+                    now=NOW,
+                )
+
+        self.assertNotIn(opaque_bearer, str(raised.exception))
+        self.assertEqual([], api.calls)
+        self.assertFalse(plan_path.exists())
+
+    def test_actor_rejects_c1_control_characters(self) -> None:
+        actor = "dashboard\u0080operator"
+
+        with self.assertRaises(DashboardPublicationError) as raised:
+            dashboard_publication._actor(actor, field="dashboard actor")
+
+        self.assertNotIn(actor, str(raised.exception))
 
     def test_api_and_cli_errors_redact_response_bodies_and_bearer_values(self) -> None:
         leaked = "Bearer very-secret-token"
@@ -570,6 +764,190 @@ class DashboardPublicationTests(unittest.TestCase):
 
         self.assertEqual(posts_after_first_apply, api.calls.count("POST"))
 
+    def test_copied_plans_concurrently_share_one_hash_bound_consumption_claim(
+        self,
+    ) -> None:
+        class ConcurrentRecordingApi(RecordingApi):
+            def __init__(self) -> None:
+                super().__init__(_existing_dashboard())
+                self.snapshot_barrier = threading.Barrier(2)
+                self.save_lock = threading.Lock()
+
+            def get_dashboard(self, dashboard_id: str) -> dict[str, object]:
+                dashboard = super().get_dashboard(dashboard_id)
+                self.snapshot_barrier.wait(timeout=10)
+                return dashboard
+
+            def save_dashboard(self, dashboard: dict[str, object]) -> dict[str, object]:
+                with self.save_lock:
+                    return super().save_dashboard(dashboard)
+
+        api = ConcurrentRecordingApi()
+        plans_dir = Path(self.temporary_directory.name) / "plans"
+        receipts_dir = Path(self.temporary_directory.name) / "receipts"
+        plans_dir.mkdir(mode=0o700)
+        receipts_dir.mkdir(mode=0o700)
+        first_plan_path = plans_dir / "first.json"
+        second_plan_path = plans_dir / "second.json"
+        plan = create_dashboard_plan(
+            self.config,
+            api=api,
+            actor="dashboard-reviewer",
+            output_path=first_plan_path,
+            now=NOW,
+        )
+        second_plan_path.write_bytes(first_plan_path.read_bytes())
+        second_plan_path.chmod(0o600)
+        receipt_paths = (receipts_dir / "first.json", receipts_dir / "second.json")
+        api.calls.clear()
+
+        def apply(plan_path: Path, receipt_path: Path) -> object:
+            try:
+                return apply_dashboard_plan(
+                    self.config,
+                    plan_path=plan_path,
+                    receipt_path=receipt_path,
+                    plan_sha256=plan.sha256,
+                    confirmed_sha256=plan.sha256,
+                    actor="dashboard-applier",
+                    api=api,
+                    now=NOW + timedelta(minutes=1),
+                )
+            except Exception as exc:
+                return exc
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(apply, (first_plan_path, second_plan_path), receipt_paths))
+
+        successes = [outcome for outcome in outcomes if isinstance(outcome, dict)]
+        failures = [outcome for outcome in outcomes if isinstance(outcome, Exception)]
+        self.assertEqual(1, len(successes))
+        self.assertEqual(1, len(failures))
+        self.assertIsInstance(failures[0], DashboardPublicationError)
+        self.assertIn("consumed", str(failures[0]))
+        self.assertEqual(1, api.calls.count("POST"))
+        self.assertEqual(1, sum(path.exists() for path in receipt_paths))
+
+        namespace = self.config.runtime_dir / ".pdm-dashboard-consumption"
+        marker_path = namespace / f"{plan.sha256}.json"
+        self.assertEqual(0o700, stat.S_IMODE(namespace.stat().st_mode))
+        self.assertEqual(os.geteuid(), namespace.stat().st_uid)
+        self.assertEqual([marker_path], list(namespace.iterdir()))
+        self.assertEqual(0o600, stat.S_IMODE(marker_path.stat().st_mode))
+        self.assertEqual(
+            plan.sha256,
+            json.loads(marker_path.read_text(encoding="utf-8"))["plan_sha256"],
+        )
+
+    def test_apply_rejects_an_unsafe_consumption_namespace_before_provider_reads(
+        self,
+    ) -> None:
+        for mutation in ("symlink", "mode", "owner"):
+            with self.subTest(mutation=mutation):
+                api = RecordingApi(_existing_dashboard())
+                plans_dir = Path(self.temporary_directory.name) / f"plans-{mutation}"
+                receipts_dir = Path(self.temporary_directory.name) / f"receipts-{mutation}"
+                plans_dir.mkdir(mode=0o700)
+                receipts_dir.mkdir(mode=0o700)
+                plan_path = plans_dir / "phase2-dashboard.json"
+                plan = create_dashboard_plan(
+                    self.config,
+                    api=api,
+                    actor="dashboard-reviewer",
+                    output_path=plan_path,
+                    now=NOW,
+                )
+                self.config.runtime_dir.mkdir(mode=0o700, exist_ok=True)
+                namespace = self.config.runtime_dir / ".pdm-dashboard-consumption"
+                outside = Path(self.temporary_directory.name) / f"outside-{mutation}"
+                outside.mkdir(mode=0o700)
+                if mutation == "symlink":
+                    namespace.symlink_to(outside, target_is_directory=True)
+                else:
+                    namespace.mkdir(mode=0o700)
+                    if mutation == "mode":
+                        namespace.chmod(0o755)
+                api.calls.clear()
+
+                real_lstat = Path.lstat
+
+                def lstat_with_wrong_namespace_owner(
+                    candidate: Path,
+                ) -> os.stat_result:
+                    result = real_lstat(candidate)
+                    if mutation == "owner" and candidate == namespace:
+                        fields = list(result)
+                        fields[4] = result.st_uid + 1
+                        return os.stat_result(fields)
+                    return result
+
+                try:
+                    with patch.object(Path, "lstat", lstat_with_wrong_namespace_owner):
+                        with self.assertRaisesRegex(
+                            DashboardPublicationError,
+                            "consumption namespace",
+                        ):
+                            apply_dashboard_plan(
+                                self.config,
+                                plan_path=plan_path,
+                                receipt_path=receipts_dir / "receipt.json",
+                                plan_sha256=plan.sha256,
+                                confirmed_sha256=plan.sha256,
+                                actor="dashboard-applier",
+                                api=api,
+                                now=NOW + timedelta(minutes=1),
+                            )
+
+                    self.assertEqual([], api.calls)
+                    self.assertEqual([], list(outside.iterdir()))
+                finally:
+                    if namespace.is_symlink():
+                        namespace.unlink()
+                    else:
+                        namespace.chmod(0o700)
+                        namespace.rmdir()
+
+    def test_apply_rejects_a_world_writable_consumption_root_before_provider_reads(
+        self,
+    ) -> None:
+        api = RecordingApi(_existing_dashboard())
+        plans_dir = self.config.root_dir / "safe-plans"
+        receipts_dir = self.config.root_dir / "safe-receipts"
+        plans_dir.mkdir(mode=0o700)
+        receipts_dir.mkdir(mode=0o700)
+        plan_path = plans_dir / "phase2-dashboard.json"
+        plan = create_dashboard_plan(
+            self.config,
+            api=api,
+            actor="dashboard-reviewer",
+            output_path=plan_path,
+            now=NOW,
+        )
+        api.calls.clear()
+        self.config.root_dir.chmod(0o777)
+
+        try:
+            with self.assertRaisesRegex(
+                DashboardPublicationError,
+                "runtime directory",
+            ):
+                apply_dashboard_plan(
+                    self.config,
+                    plan_path=plan_path,
+                    receipt_path=receipts_dir / "receipt.json",
+                    plan_sha256=plan.sha256,
+                    confirmed_sha256=plan.sha256,
+                    actor="dashboard-applier",
+                    api=api,
+                    now=NOW + timedelta(minutes=1),
+                )
+        finally:
+            self.config.root_dir.chmod(0o700)
+
+        self.assertEqual([], api.calls)
+        self.assertFalse(self.config.runtime_dir.exists())
+        self.assertFalse((receipts_dir / "receipt.json").exists())
+
     def test_apply_rejects_a_receipt_path_that_aliases_its_consumption_marker(self) -> None:
         api = RecordingApi(_existing_dashboard())
         plans_dir = Path(self.temporary_directory.name) / "plans"
@@ -582,13 +960,16 @@ class DashboardPublicationTests(unittest.TestCase):
             output_path=plan_path,
             now=NOW,
         )
+        self.config.runtime_dir.mkdir(mode=0o700, exist_ok=True)
+        consumption_namespace = self.config.runtime_dir / ".pdm-dashboard-consumption"
+        consumption_namespace.mkdir(mode=0o700)
         api.calls.clear()
 
         with self.assertRaisesRegex(DashboardPublicationError, "distinct"):
             apply_dashboard_plan(
                 self.config,
                 plan_path=plan_path,
-                receipt_path=plans_dir / ".phase2-dashboard.json.consumed",
+                receipt_path=consumption_namespace / f"{plan.sha256}.json",
                 plan_sha256=plan.sha256,
                 confirmed_sha256=plan.sha256,
                 actor="dashboard-applier",
@@ -597,6 +978,215 @@ class DashboardPublicationTests(unittest.TestCase):
             )
 
         self.assertEqual([], api.calls)
+
+    def test_apply_rejects_an_opaque_managed_bearer_as_actor_before_posting(
+        self,
+    ) -> None:
+        api = RecordingApi(_existing_dashboard())
+        opaque_bearer = "opaque-dashboard-credential-e16a9b72"
+        plan = self._plan(api)
+        api.calls.clear()
+
+        with patch.dict(
+            os.environ,
+            {"TB_PDM_DASHBOARD_BEARER_TOKEN": opaque_bearer},
+            clear=False,
+        ):
+            with self.assertRaises(DashboardPublicationError) as raised:
+                apply_dashboard_plan(
+                    self.config,
+                    plan_sha256=plan.sha256,
+                    confirmed_sha256=plan.sha256,
+                    actor=opaque_bearer,
+                    api=api,
+                    now=NOW + timedelta(minutes=1),
+                )
+
+        self.assertNotIn(opaque_bearer, str(raised.exception))
+        self.assertEqual([], api.calls)
+        receipt_path = self.config.runtime_dir / "pdm-dashboard-receipt.json"
+        self.assertFalse(receipt_path.exists())
+        self.assertNotIn(
+            opaque_bearer,
+            "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in self.config.runtime_dir.rglob("*")
+                if path.is_file()
+            ),
+        )
+
+    def test_apply_rejects_an_actor_containing_the_complete_managed_bearer(
+        self,
+    ) -> None:
+        api = RecordingApi(_existing_dashboard())
+        opaque_bearer = "opaque-dashboard-credential-b7138fd4"
+        actor = f"reviewer:{opaque_bearer}:phase2"
+        plan = self._plan(api)
+        api.calls.clear()
+
+        with patch.dict(
+            os.environ,
+            {"TB_PDM_DASHBOARD_BEARER_TOKEN": opaque_bearer},
+            clear=False,
+        ):
+            with self.assertRaises(DashboardPublicationError) as raised:
+                apply_dashboard_plan(
+                    self.config,
+                    plan_sha256=plan.sha256,
+                    confirmed_sha256=plan.sha256,
+                    actor=actor,
+                    api=api,
+                    now=NOW + timedelta(minutes=1),
+                )
+
+        self.assertNotIn(opaque_bearer, str(raised.exception))
+        self.assertEqual([], api.calls)
+        self.assertFalse((self.config.runtime_dir / "pdm-dashboard-receipt.json").exists())
+        self.assertNotIn(
+            opaque_bearer,
+            "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in self.config.runtime_dir.rglob("*")
+                if path.is_file()
+            ),
+        )
+
+    def test_apply_rejects_a_plan_swapped_to_a_symlink_after_path_validation(
+        self,
+    ) -> None:
+        api = RecordingApi(_existing_dashboard())
+        plan = self._plan(api)
+        plan_path = self.config.runtime_dir / "pdm-dashboard-plan.json"
+        replacement = self.config.runtime_dir / "replacement.json"
+        replacement.write_bytes(plan_path.read_bytes())
+        replacement.chmod(0o600)
+        api.calls.clear()
+        real_read_plan = dashboard_publication._read_plan
+
+        def swap_then_read(selected_path: Path) -> dict[str, object]:
+            selected_path.unlink()
+            selected_path.symlink_to(replacement)
+            return real_read_plan(selected_path)
+
+        with patch(
+            "factory_simulator.dashboard_publication._read_plan",
+            side_effect=swap_then_read,
+        ):
+            with self.assertRaisesRegex(
+                DashboardPublicationError,
+                "safe dashboard plan file",
+            ):
+                apply_dashboard_plan(
+                    self.config,
+                    plan_sha256=plan.sha256,
+                    confirmed_sha256=plan.sha256,
+                    actor="dashboard-applier",
+                    api=api,
+                    now=NOW + timedelta(minutes=1),
+                )
+
+        self.assertEqual([], api.calls)
+
+    def test_plan_reader_rejects_a_fifo_without_blocking(self) -> None:
+        fifo_path = Path(self.temporary_directory.name) / "plan.fifo"
+        os.mkfifo(fifo_path, mode=0o600)
+        script = """
+import sys
+from pathlib import Path
+from factory_simulator.dashboard_publication import (
+    DashboardPublicationError,
+    _read_plan,
+)
+
+try:
+    _read_plan(Path(sys.argv[1]))
+except DashboardPublicationError:
+    raise SystemExit(0)
+raise SystemExit(1)
+"""
+        environment = dict(os.environ)
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-c", script, str(fifo_path)],
+                cwd=ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            self.fail("dashboard plan reader blocked while opening a FIFO")
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+
+    def test_plan_reader_rejects_canonical_input_larger_than_eight_mebibytes(
+        self,
+    ) -> None:
+        oversized_plan = Path(self.temporary_directory.name) / "oversized-plan.json"
+        oversized_plan.write_bytes(b'{"padding":"' + (b"a" * (8 * 1024 * 1024)) + b'"}\n')
+        oversized_plan.chmod(0o600)
+
+        with self.assertRaisesRegex(DashboardPublicationError, "size limit"):
+            dashboard_publication._read_plan(oversized_plan)
+
+    def test_plan_reader_rejects_nonfinite_json_with_a_stable_error(self) -> None:
+        for index, literal in enumerate((b"NaN", b"Infinity", b"-Infinity", b"1e999")):
+            with self.subTest(literal=literal):
+                plan_path = Path(self.temporary_directory.name) / f"nonfinite-plan-{index}.json"
+                plan_path.write_bytes(b'{"value":' + literal + b"}\n")
+                plan_path.chmod(0o600)
+
+                with self.assertRaisesRegex(
+                    DashboardPublicationError,
+                    "not canonical JSON",
+                ):
+                    dashboard_publication._read_plan(plan_path)
+
+    def test_cli_maps_deep_json_recursion_to_a_stable_error_before_provider_reads(
+        self,
+    ) -> None:
+        api = RecordingApi(_existing_dashboard())
+        plan_path = Path(self.temporary_directory.name) / "deep-plan.json"
+        receipt_path = Path(self.temporary_directory.name) / "deep-receipt.json"
+        plan_path.write_bytes(b'{"nested":' + (b"[" * 1200) + b"0" + (b"]" * 1200) + b"}\n")
+        plan_path.chmod(0o600)
+        error_output = io.StringIO()
+
+        with patch(
+            "factory_simulator.dashboard_publication._managed_api",
+            return_value=api,
+        ):
+            with contextlib.redirect_stderr(error_output):
+                try:
+                    exit_code: int | str = main(
+                        [
+                            "--config",
+                            str(CONFIG_PATH),
+                            "dashboard-apply",
+                            "--plan",
+                            str(plan_path),
+                            "--plan-hash",
+                            "a" * 64,
+                            "--confirmed-hash",
+                            "a" * 64,
+                            "--actor",
+                            "dashboard-applier",
+                            "--receipt",
+                            str(receipt_path),
+                        ]
+                    )
+                except RecursionError:
+                    exit_code = "uncaught recursion"
+
+        self.assertEqual(1, exit_code)
+        self.assertIn("ERROR:", error_output.getvalue())
+        self.assertNotIn("Traceback", error_output.getvalue())
+        self.assertNotIn("RecursionError", error_output.getvalue())
+        self.assertEqual([], api.calls)
+        self.assertFalse(receipt_path.exists())
 
     def test_apply_rechecks_tenant_dashboard_version_and_body_before_one_save(self) -> None:
         for mutation in ("tenant", "version", "body"):
@@ -744,9 +1334,7 @@ class DashboardPublicationTests(unittest.TestCase):
         plan = self._plan(api)
         plan_path = self.config.runtime_dir / "pdm-dashboard-plan.json"
         payload = json.loads(plan_path.read_text())
-        payload["desired_dashboard"]["configuration"]["nested"] = {
-            "apiKey": "credential-value"
-        }
+        payload["desired_dashboard"]["configuration"]["nested"] = {"apiKey": "credential-value"}
         plan_path.write_text(json.dumps(payload), encoding="utf-8")
         os.chmod(plan_path, 0o600)
 
