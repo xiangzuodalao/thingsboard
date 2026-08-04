@@ -258,6 +258,8 @@ ThingsBoard 现有 HTTP interceptor 为同源请求附加当前会话身份；�
 租户、仪表盘 ID、版本和内容哈希，且至多保存一次。计划、消费标记和回执均为权限
 `0600` 的无凭据 strict canonical JSON；计划超过 8 MiB 或包含非有限数值时会在
 创建任何文件前被拒绝，tuple、自定义 iterable 等非 JSON 原生容器同样不被接受。
+内容核验会排除 ThingsBoard 从 `title` 派生的只读 `name`，并仅将响应中的
+`resources: null` 与请求中的空 `resources: []` 视为等价；非空资源始终参与哈希。
 消费权按已确认的计划 SHA-256 唯一绑定，并固定
 记录在 `.runtime/.pdm-dashboard-consumption/` 这个权限为 `0700`、由当前用户拥有
 的命名空间中；从配置根目录到该命名空间的每一级都必须由当前用户拥有、不可经由

@@ -1232,6 +1232,71 @@ raise SystemExit(1)
         self.assertFalse(receipt["saved"])
         self.assertNotIn("POST", api.calls)
 
+    def test_apply_accepts_thingsboard_derived_name_and_null_empty_resources(
+        self,
+    ) -> None:
+        class ThingsBoardNormalizingApi(RecordingApi):
+            def save_dashboard(self, dashboard: dict[str, object]) -> dict[str, object]:
+                saved = super().save_dashboard(dashboard)
+                saved["name"] = saved["title"]
+                saved["resources"] = None
+                self.dashboard = copy.deepcopy(saved)
+                return saved
+
+        api = ThingsBoardNormalizingApi(_existing_dashboard())
+        plan = self._plan(api)
+        api.calls.clear()
+
+        receipt = apply_dashboard_plan(
+            self.config,
+            plan_sha256=plan.sha256,
+            confirmed_sha256=plan.sha256,
+            api=api,
+            now=NOW + timedelta(minutes=1),
+        )
+
+        self.assertTrue(receipt["saved"])
+        self.assertEqual(1, api.calls.count("POST"))
+
+    def test_dashboard_body_keeps_nonempty_resources_in_the_integrity_hash(self) -> None:
+        dashboard = _existing_dashboard()
+        dashboard["name"] = DASHBOARD_TITLE
+        dashboard["resources"] = None
+        normalized_empty = dashboard_publication._dashboard_body_sha256(dashboard)
+
+        dashboard["resources"] = [{"key": "managed-resource"}]
+        nonempty = dashboard_publication._dashboard_body_sha256(dashboard)
+        del dashboard["resources"]
+
+        self.assertNotEqual(normalized_empty, nonempty)
+        self.assertNotEqual(
+            normalized_empty, dashboard_publication._dashboard_body_sha256(dashboard)
+        )
+
+    def test_response_loss_accepts_normalized_dashboard_readback(self) -> None:
+        class ThingsBoardNormalizingApi(RecordingApi):
+            def save_dashboard(self, dashboard: dict[str, object]) -> dict[str, object]:
+                saved = super().save_dashboard(dashboard)
+                saved["name"] = saved["title"]
+                saved["resources"] = None
+                self.dashboard = copy.deepcopy(saved)
+                raise ConnectionError("response was lost")
+
+        api = ThingsBoardNormalizingApi(_existing_dashboard())
+        plan = self._plan(api)
+        api.calls.clear()
+
+        receipt = apply_dashboard_plan(
+            self.config,
+            plan_sha256=plan.sha256,
+            confirmed_sha256=plan.sha256,
+            api=api,
+            now=NOW + timedelta(minutes=1),
+        )
+
+        self.assertTrue(receipt["recovered_response_loss"])
+        self.assertEqual(["GET", "GET", "POST", "GET"], api.calls)
+
     def test_response_loss_recovers_only_after_exact_desired_dashboard_readback(self) -> None:
         api = RecordingApi(_existing_dashboard())
         plan = self._plan(api)

@@ -50,7 +50,9 @@ RECEIPT_FILENAME = "pdm-dashboard-receipt.json"
 _CONSUMPTION_NAMESPACE = ".pdm-dashboard-consumption"
 _MAX_PLAN_BYTES = 8 * 1024 * 1024
 PLAN_TTL = timedelta(minutes=30)
-_SERVER_MANAGED_FIELDS = frozenset({"id", "version", "createdTime", "tenantId"})
+_SERVER_MANAGED_FIELDS = frozenset(
+    {"id", "version", "createdTime", "tenantId", "name"}
+)
 _SENSITIVE_KEY_TERMS = (
     "token",
     "password",
@@ -150,11 +152,17 @@ def _sha256(payload: dict[str, Any]) -> str:
 
 
 def _dashboard_body(dashboard: dict[str, Any]) -> dict[str, Any]:
-    return {
+    body = {
         key: copy.deepcopy(value)
         for key, value in dashboard.items()
         if key not in _SERVER_MANAGED_FIELDS
     }
+    # ThingsBoard derives ``name`` from ``title`` and does not persist an empty
+    # resources collection. Its save/readback response therefore returns null
+    # for the explicit [] used by this managed dashboard payload.
+    if "resources" in body and body["resources"] is None:
+        body["resources"] = []
+    return body
 
 
 def _dashboard_body_sha256(dashboard: dict[str, Any]) -> str:
