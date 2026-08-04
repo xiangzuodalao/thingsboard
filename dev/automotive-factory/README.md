@@ -228,7 +228,25 @@ tenant@thingsboard.org / tenant
 
 试点仪表盘的设备表会以只读 Server Attribute 显示 `equipment_id` 与
 `cmms_asset_id`。模拟器不会生成或写入这两个标识；它们由后续经确认的
-设备建档流程提供。告警表不含操作按钮，本阶段也不会变更告警。
+设备建档流程提供。告警表保留 ThingsBoard 原生 ACK，但关闭原生 Clear；
+预测风险只能由集成服务在连续健康预测达到策略要求后清除。
+
+`TB_PDM_MAINTENANCE_ACTIONS_ENABLED` 默认为 `false`，此时仪表盘中完全不发布
+CMMS 操作。只有隔离闭环试点及其同源网关已经启动时，才在本地 `.env` 中将其
+改为 `true`，重新执行受管的 `dashboard-plan` 和 `dashboard-apply`。启用后，
+只有状态为活动、风险仍有效、维护状态为 `PENDING_APPROVAL` 且服务端明确标记
+`work_order_action_allowed=true` 的 `PDM_FORECAST_RISK` 告警才显示“创建维护工单”。
+
+按钮始终使用同源相对路径：先读取
+`/api/v1/maintenance-alerts/{alert_id}/work-order-plan`，展示设备、风险、固定
+优先级和完整计划哈希；操作员确认后再向同一告警的 `/actions` 发送一次
+`CREATE_WORK_ORDER`。请求绑定当前告警版本、确认的计划哈希和稳定的
+`Idempotency-Key`；重复点击会被页面内的 in-flight guard 拒绝，业务失败不会
+自动重试。`409`/`412` 表示告警或计划已经变化，必须刷新后重新预览。
+
+Action 不读取、复制或持久化登录凭据。请求必须保持 `/api/...` 相对路径，由
+ThingsBoard 现有 HTTP interceptor 为同源请求附加当前会话身份；不要在 Dashboard
+配置中加入绝对 Integration URL、认证头、Cookie 或任何凭据。
 
 默认 `.env.example` 通过 `TB_PDM_DASHBOARD_MANAGED_PUBLICATION=true` 启用受管
 发布。先通过只读身份发现确认租户 UUID，再将其复制到本地、未跟踪的 `.env`
