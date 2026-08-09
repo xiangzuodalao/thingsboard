@@ -1,0 +1,245 @@
+#
+# Copyright © 2016-2026 The Thingsboard Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+version: 1
+
+thingsboard:
+  base_url: http://127.0.0.1:8080
+  tenant_username_env: TB_TENANT_USERNAME
+  tenant_password_env: TB_TENANT_PASSWORD
+  request_timeout_seconds: 10
+
+mqtt:
+  host: 127.0.0.1
+  port: 1883
+  qos: 1
+  keepalive_seconds: 60
+  telemetry_topic: v1/devices/me/telemetry
+  publish_timeout_seconds: 5
+
+simulation:
+  interval_seconds: 2
+  random_seed: 20260724
+  state_change_probability: 0.01
+  normal_state_weights:
+    RUNNING: 0.88
+    IDLE: 0.08
+    SETUP: 0.03
+    MAINTENANCE: 0.01
+  automatic_faults:
+    enabled: false
+    probability_per_device_cycle: 0.001
+    duration_seconds:
+      min: 20
+      max: 60
+
+lines:
+  - id: LINE-A
+    devices:
+      CNC: 2
+      INJECTION_MOLDING: 2
+      ASSEMBLY_ROBOT: 2
+      TIGHTENING: 2
+      AIR_COMPRESSOR: 1
+      EOL_TESTER: 1
+  - id: LINE-B
+    devices:
+      CNC: 2
+      INJECTION_MOLDING: 2
+      ASSEMBLY_ROBOT: 2
+      TIGHTENING: 2
+      AIR_COMPRESSOR: 1
+      EOL_TESTER: 1
+
+common_metrics:
+  load_pct: {min: 35, max: 92, initial: 62, step: 4, precision: 1}
+  temperature: {min: 24, max: 78, initial: 42, step: 1.5, precision: 1}
+  vibration_rms: {min: 0.2, max: 4.5, initial: 1.2, step: 0.25, precision: 2}
+  current: {min: 4, max: 125, initial: 36, step: 4, precision: 1}
+  voltage: {min: 370, max: 410, initial: 380, step: 2, precision: 1}
+  power: {min: 2, max: 82, initial: 25, step: 3, precision: 2}
+  cycle_time: {min: 8, max: 120, initial: 35, step: 3, precision: 2}
+  running_hours:
+    generator: counter
+    initial: 1250
+    precision: 4
+
+device_types:
+  CNC:
+    label: CNC 加工中心
+    metrics:
+      spindle_speed: {min: 1200, max: 12000, initial: 6500, step: 500, precision: 0}
+      spindle_load: {min: 20, max: 95, initial: 58, step: 5, precision: 1}
+      spindle_temperature: {min: 28, max: 82, initial: 47, step: 2, precision: 1}
+      tool_usage_count:
+        generator: counter
+        initial: 230
+        increment_probability: 0.08
+        increment: 1
+        precision: 0
+  INJECTION_MOLDING:
+    label: 注塑机
+    metrics:
+      injection_pressure: {min: 65, max: 165, initial: 110, step: 7, precision: 1}
+      mold_temperature: {min: 40, max: 105, initial: 72, step: 2, precision: 1}
+      clamping_force: {min: 400, max: 1600, initial: 950, step: 45, precision: 1}
+      reject_rate: {min: 0, max: 4.5, initial: 0.8, step: 0.25, precision: 2}
+  ASSEMBLY_ROBOT:
+    label: 装配机器人
+    metrics:
+      joint_temperature: {min: 25, max: 72, initial: 40, step: 1.5, precision: 1}
+      joint_current: {min: 2, max: 38, initial: 12, step: 2, precision: 1}
+      position_deviation: {min: 0.01, max: 0.75, initial: 0.12, step: 0.05, precision: 3}
+      collision_count:
+        generator: counter
+        initial: 0
+        increment_probability: 0
+        increment: 1
+        precision: 0
+  TIGHTENING:
+    label: 自动拧紧设备
+    metrics:
+      torque: {min: 18, max: 85, initial: 45, step: 3, precision: 2}
+      angle: {min: 30, max: 270, initial: 120, step: 12, precision: 1}
+      tightening_time: {min: 0.8, max: 5.5, initial: 2.1, step: 0.25, precision: 2}
+      result_ok:
+        generator: boolean
+        true_probability: 0.992
+  AIR_COMPRESSOR:
+    label: 空压机
+    metrics:
+      discharge_pressure: {min: 0.55, max: 0.9, initial: 0.72, step: 0.03, precision: 3}
+      discharge_temperature: {min: 45, max: 98, initial: 68, step: 2, precision: 1}
+      air_flow: {min: 15, max: 85, initial: 48, step: 4, precision: 1}
+  EOL_TESTER:
+    label: EOL 检测台
+    metrics:
+      test_duration: {min: 15, max: 95, initial: 38, step: 3, precision: 2}
+      pass_rate: {min: 92, max: 100, initial: 98.5, step: 0.3, precision: 2}
+      measured_value: {min: 9.5, max: 10.5, initial: 10, step: 0.05, precision: 3}
+      calibration_status:
+        generator: choice
+        choices: [VALID]
+
+fault_modes:
+  HIGH_TEMPERATURE:
+    label: 温度过高
+    applies_to: ["*"]
+    alarm_code: TEMP_HIGH
+    severity: MAJOR
+    operating_state: ALARM
+    quality_status: NG
+    overrides:
+      temperature: 105
+  HIGH_VIBRATION:
+    label: 振动异常
+    applies_to: [CNC, ASSEMBLY_ROBOT, AIR_COMPRESSOR]
+    alarm_code: VIB_HIGH
+    severity: MAJOR
+    operating_state: ALARM
+    quality_status: NG
+    overrides:
+      vibration_rms: 12.5
+  OVERLOAD:
+    label: 设备过载
+    applies_to: ["*"]
+    alarm_code: LOAD_HIGH
+    severity: CRITICAL
+    operating_state: ALARM
+    quality_status: NG
+    overrides:
+      load_pct: 99.5
+      current: 148
+  UNPLANNED_STOP:
+    label: 非计划停机
+    applies_to: ["*"]
+    alarm_code: UNPLANNED_STOP
+    severity: CRITICAL
+    operating_state: STOPPED
+    quality_status: NG
+    overrides:
+      load_pct: 0
+      power: 0
+  QUALITY_FAILURE:
+    label: 质量不合格
+    applies_to: [INJECTION_MOLDING, TIGHTENING, EOL_TESTER]
+    alarm_code: QUALITY_NOK
+    severity: MAJOR
+    operating_state: ALARM
+    quality_status: NOK
+    overrides:
+      result_ok: false
+      reject_rate: 12.5
+      pass_rate: 78
+  TOOL_WEAR:
+    label: 刀具寿命到期
+    applies_to: [CNC]
+    alarm_code: TOOL_WEAR
+    severity: WARNING
+    operating_state: MAINTENANCE
+    quality_status: SUSPECT
+    overrides:
+      spindle_load: 98
+      tool_usage_count: 5000
+  ROBOT_COLLISION:
+    label: 机器人碰撞
+    applies_to: [ASSEMBLY_ROBOT]
+    alarm_code: ROBOT_COLLISION
+    severity: CRITICAL
+    operating_state: STOPPED
+    quality_status: NG
+    overrides:
+      collision_count: 1
+      position_deviation: 4.5
+  PRESSURE_ANOMALY:
+    label: 压力异常
+    applies_to: [INJECTION_MOLDING, AIR_COMPRESSOR]
+    alarm_code: PRESSURE_ABNORMAL
+    severity: MAJOR
+    operating_state: ALARM
+    quality_status: NG
+    overrides:
+      injection_pressure: 190
+      discharge_pressure: 0.38
+  TIGHTENING_NOK:
+    label: 拧紧结果不合格
+    applies_to: [TIGHTENING]
+    alarm_code: TORQUE_NOK
+    severity: MAJOR
+    operating_state: ALARM
+    quality_status: NOK
+    overrides:
+      torque: 12
+      result_ok: false
+  CALIBRATION_DUE:
+    label: 检测台需要校准
+    applies_to: [EOL_TESTER]
+    alarm_code: CALIBRATION_DUE
+    severity: WARNING
+    operating_state: MAINTENANCE
+    quality_status: SUSPECT
+    overrides:
+      calibration_status: EXPIRED
+  COMMUNICATION_LOSS:
+    label: 通信中断
+    applies_to: ["*"]
+    alarm_code: COMM_LOSS
+    severity: CRITICAL
+    operating_state: OFFLINE
+    quality_status: UNKNOWN
+    disconnect_mqtt: true
+    overrides:
+      online: false
